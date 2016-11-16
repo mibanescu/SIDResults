@@ -338,9 +338,9 @@ comments to the top of the results).
 
    The results will save as a plain text file at this point in time.
 If you want the output to be in html form for web publishing, click
-the <Turn HTML On> button. This button will toggle html code on or off.
+the `<Turn HTML On>` button. This button will toggle html code on or off.
 With html toggled on, you will see the raw html commands (little 
-tags like <html> or <title>, etc) scattered through the results section.
+tags like `<html>` or `<title>`, etc) scattered through the results section.
 When you save the results in this form, you can read the resulting 
 Results.html file into your web browser to see what it looks like. 
 

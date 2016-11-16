@@ -8,8 +8,8 @@ exec wish "$0" ${1+"$@"}
 #	Ken. Hanson
 #	Started: 2008/02/27
 #
-set     SIDRVersion "0.89u"
-#       Last modified 2014/02/11
+set     SIDRVersion "0.89w"
+#       Last modified 2016/11/10
 #
 # This program is used to generate web-ready results from an 
 # Orienteering meet managed by e-punch. 
@@ -26,7 +26,10 @@ set debug 0		;# 0: No debug.  1: Basic monitoring.  2: Higher level.  3: Highest
 # Major Todo:
 #
 #
+# Edit results for score-o
 #
+#
+# Document A-Meet features
 #
 # Read start/control/finish box files. 
 #   Convention for saving: Save in event subdirectory. Start.csv, NN.csv, Finish.csv
@@ -89,6 +92,8 @@ set debug 0		;# 0: No debug.  1: Basic monitoring.  2: Higher level.  3: Highest
 #   Check day-of-week (likeliest place to spot the frameshift)
 #   If frameshifted, just give an error and stop processing that line
 #
+# Allow comments in: Competitors.txt, ... (find out how many files does this not work in)
+#
 #
 # Minor Todo:
 # Rewrite code. Untangle the routines to make the flow easier to read and manage.
@@ -112,6 +117,16 @@ set debug 0		;# 0: No debug.  1: Basic monitoring.  2: Higher level.  3: Highest
 #   Input box for Length in km
 #   Delete button for spurious courses
 #   Save button to write (then use) courses.txt from what is there.
+# Score-O
+#   Option for absolute time cutoff: 
+#   Option: Force punching of certain controls (e.g. ARDF: Must punch finish plus one control)
+#
+# Known Bugs:
+# On editing a result time, the entry is sorted correctly, but new place numbers are not calculated.
+# When checking to clear duplications, some cards do not store clear time; these cards will not 
+#   have duplicates cleared.  Now that the check for SI-card number is in place, may change to checking
+#   for start time instead, or at least fallback to that if there is no clear time.
+#
 #
 # Change list (started late, so many early changes not logged here)
 # 080227 Program started by Ken. Hanson. At this time, all changes by KH unless noted otherwise.
@@ -150,7 +165,7 @@ set debug 0		;# 0: No debug.  1: Basic monitoring.  2: Higher level.  3: Highest
 #        Added editing of final result.
 #        Added treatment of Score-O type events.
 #        Have started additions for use of the software during an A-Meet.
-#        Done. New input and output files								Done.
+# 120310 Done. New input and output files								Done.
 #              New file type: Event. (Changed->AMeet mode, and courses.txt options)			Done
 #              Read competitors										Done
 #              Start an event mode.									Done
@@ -182,15 +197,19 @@ set debug 0		;# 0: No debug.  1: Basic monitoring.  2: Higher level.  3: Highest
 #              Calculate when best possible finish time could not beat 3rd place, assuming given start.	(Might not happen)
 #              Continuously update approximate time out on course for unfinished runners		Done, want clearer output than SS/US
 #              Remember to set AlwaysRecalcOnTimerEvent to force continuous updates			Done, but want better control(s)
+#        0.89, not released, but used at Birkhead A-Meet
 # 130109 Released 0.89o, which recognises the new version of the header files now found on results downloads.
 #        Still cleaning up code toward SIDR 0.90
 # 131004 0.89q Last save before revision to handle a-meet score-o.
 # 131006 0.89r Fixed Score-O output for AMeets. (Multi-column output still to be done.)
 # 140211 0.89u Fixed problem in GuessCourse, plus minor problem with handling a course-not-found situation.
+# 151109 0.89v Working on problems with new download formatting. Currently only recognise new header, but some columns appear moved as well.
+# 161006 0.89w Added ability to remove the time from a leg: @removeleg  @maxremovelegtime
 
 # Some globals
 #
 set OvertimeLimit	"3:00:00"	;# This is the max time for a finish result. Anything over will be an OVT.
+set MaxRemoveLegTime    "1:00"		;# This is the max time to be removed from a "removed leg". Anything over this is just malingering and is counted.
 
 # In default filename settings below, if there are both "...Filename" and "...Filenames" versions, the
 # singular version is obsolete; code will now check for each name in ...Filenames and use the first 
@@ -203,7 +222,7 @@ set DefaultNumToNameFilenames {"SINames" "SInames" "SINames.txt" "SInames.txt" "
 set DefaultGlobalNumToNameFNs {"SINames" "SInames" "SINames.txt" "SInames.txt" "SINamesGlobal" "SINamesGlobal.txt"}
 set DefaultCompetitorsDBFilenames {"Competitors" "Competitors.txt"}
 #
-set CompetitorsDBForm 2		;# 1: Name,Club,Elig,SI1,Class1,...SIN,ClassN
+set CompetitorsDBForm 1		;# 1: Name,Club,Elig,SI1,Class1,...SIN,ClassN
 #				   2: Name,Club,YOB,Elig,SI1,Class1,...SIN,ClassN,Firstname,Lastname
 set DefaultStarttimesDBFilenames {"Starttimes" "Starttimes.txt"}
 set DefaultTimeshiftFNs   {"Timeshift" "timeshift" "Timeshift.txt" "timeshift.txt"}
@@ -217,6 +236,8 @@ set DoRsync	0		;# Activate the rsync to the webserver on every update
 set MakeWebpageRefresh 0	;# Boolean.  0: Simple web page.  1: Web page does auto-refresh (useful with live updates)
 set WebpageRefreshTime 10	;# Seconds. Only used if MakeWebpageRefresh == 1
 set ShowLegend 0		;# Explain SS, US
+set DoubleEligColumn 0		;# Kludge. If 1, duplicates the Elig place column of output, to make easier the hand editing for a 3rd elig category
+set ARDFTitleKludge 0		;# Kludge. If 1, add a special header above results. 
 
 set HTMLTitle "Date, Location"
 set HTMLType 1			;# 0: Simple.  1: Column flow.
@@ -224,7 +245,7 @@ set HTMLType 1			;# 0: Simple.  1: Column flow.
 # NameFieldLen($courseidx)	This is the size of the largest name on this course (or NameFieldLenMax)
 # NameFieldLenCN($coursename)	This version is used for multi-column output. (The checks for who is on each course are slightly different in each case.)
 set NameFieldLenDefault 10	;# Starts here. Can set an effective fixed length by making this equal to NameFieldLenMax
-set NameFieldLenMax 42		;# won't increase beyond this length, even if someone's name (likely a team) is longer than this)
+set NameFieldLenMax 48		;# won't increase beyond this length, even if someone's name (likely a team) is longer than this)
 #set NameFieldLenDefault 20	;# Uncomment these, and comment out the above, for fixed name length sizes 
 #set NameFieldLenMax 20		;#
 set NameFieldLen(-1) $NameFieldLenDefault
@@ -300,7 +321,8 @@ set OutputColumnHeaders 0	;# Boolean. If 0, don't use OutputColumnName(e,c) (it 
 # db(FinishTime,$i)	Finish time, hh:mm:ss form
 # db(TotalTime,$i)	FinishTime - StartTime, in hh:mm:ss format, regardless of course finish, etc. May be corrected if controls are thrown out.
 # db(EditResult,$i)	This is a value that can be entered by the program user to override what would otherwise be the result. Allows SPW, DSQ, etc.
-# db(FinalResult,$i)	Result (this event): Time, Pseudotime-since-start, DNF, OVT, user edit, DSQ etc. Takes into account all factors.
+# db(FinalResult,$i)	Result (this event): Time, Pseudotime-since-start, DNF, OVT, user edit, DSQ etc. Takes into account all factors (except for score, in Score-O).
+# db(FinalScore,$i)	A final score in Score-O; this will take into account points for controls visited, time penalties, setting to 0 for DSQ etc, user edits etc.
 # db(Course,$i)		Index of course assigned to this entry. May be a guess or imposed by user input
 # db(Finished,$i)	Boolean. Did this entry finish the course as set in db(Course,$i)
 # db(NumCPunches,$i)	Number of valid controls punched on the course assigned this entry
@@ -313,9 +335,10 @@ set OutputColumnHeaders 0	;# Boolean. If 0, don't use OutputColumnName(e,c) (it 
 # db(SplitTime,$i)	List, split times for each punch in CPunches list, plus finish
 # db(CourseResults,$i)	List of all courses (by name) for which we have a ColResult generated, i.e. all courses for which this entry ran, for which we need output
 # db(ColResult,$c,$i)	Result (time, or DNF, "", etc) for column c of output. Obsolete. See the version which includes course
-# db(ColResult,$course,$col,$i)	Result (time, or DNF, "", etc) for the given course, for column col of output
+# db(ColResult,$course,$col,$i)	Result (time, or DNF, "", etc) for the given course, for column col of output. Note: In Score-O event, this is just the time.
 # db(ColPlace,$course,$col,$i)	Place (1,2,3,... or ""), as calculated and saved for a previous event
 # db(ColPlaceElig, ...		Place ... elig.
+# db(ColScore,$course,$col,$i)	Score for the given course, for column col of output. 
 # db(DelayedWarnings,$i)List, any warnings to go to the error log only after duplicates have been cleared. 
 #
 # Note that normal indices into db are positive.
@@ -341,6 +364,7 @@ set MaxCompIdx -1	;# The indices in db which are negative willrange from -2 down
 # Comp(ResultPlace,$n,$name)	Result place for event n. "" if no info. 1,2,... if placed, " " if a DNF, DNS, etc
 # Comp(ResultEPlace,$n,$name)	Reault place for event n, out of only elig runners. "" if not elig, or no info, ...
 # Comp(ResultTime,$n,$name)	Result time  for event n. "" if no info. Time value (hh:mm:ss) if finished. DNF, DNS, etc if not finished.
+# Comp(ResultScore,$n,$name)	Result score for event n. Defaults to 0 (for non-Score-O event, for example). Simple number.
 # Comp(ResultClass,$n,$name)	Class (name) for which the result was obtained (stored here just in case it is different from expected)
 # Comp(ResultClassIdx,$n,$name)	Class (index) ...
 # Comp(DBIdx,$name)	Index to download result in db for this competitor; if no download yet, will be a negative value into a faked db record.
@@ -361,6 +385,9 @@ set MaxCompIdx -1	;# The indices in db which are negative willrange from -2 down
 # ControlThrownOut($n,$c) Where $n is a control number, and $c is a course name or "All". If exists, and is eq "yes", then
 #			this control is thrown out of the indicated course (or all courses). The time for any leg before
 #			or after this control will be thrown out, and the control is skippable.
+# RemoveLeg($n1,$n2,$c)	Where $n1 and $n2 are control numbers indicating a leg, and $c is a course name or "All". If exists, and is eq "yes", then
+#			the leg from n1 to n2 on the indicated course (or all courses) is to be thrown out. The controls are NOT optional,
+#			but the time for this leg will not be added to final time. 
 # ControlValue($n)	The point value of control number $n (in a Score-O). Not guaranteed to exist for all controls.
 #
 # EvNNumCourses($event), EvNCourseName($event,$c), EvNCourseNames($event), ... EvNControlValue($event,$n)
@@ -506,6 +533,31 @@ return $returnstring	# Quoting doesn't work yet. TODO
 # split on spaces
 # for each item in splitlist, replace all <<sp>> with spaces
 #  
+}
+
+proc IsLegRemoved {Control1 Control2 Course} {
+global RemoveLeg
+global debug
+# WORKA
+# Return 1 if the leg from Control1 to Control2 is to be removed (up to the maxremovetime),
+# or return 0 otherwise
+#
+if { $Control1 eq "S" || $Control1 eq "start" || $Control1 eq "START"} {
+  # Give a consistent value for "Start"
+  set Control1 "Start"
+  }
+if { $Control2 eq "F" || $Control2 eq "finish" || $Control2 eq "FINISH"} {
+  # Give a consistent value for "Finish"
+  set Control2 "Finish"
+  }
+if {[info exists RemoveLeg($Control1,$Control2,$Course)] && $RemoveLeg($Control1,$Control2,$Course) eq "yes"} {
+  ErrorMsg "Found a hit on a removed leg: $Control1 $Control2 $Course"
+  if {$debug >= 3} {puts "IsLegRemoved True"}
+  return 1
+  } else {
+  if {$debug >= 3} {puts "IsLegRemoved False RemoveLeg($Control1,$Control2,$Course)"}
+  return 0
+  }
 }
 
 #------------------------------------------------------------------------------------------------------
@@ -720,6 +772,25 @@ proc TimeSubtract {Time1 Time2} {
 if {[IsDNF $Time1] || [IsDNF $Time2]} return ""
 set Seconds1 [TimeToSec $Time1]
 set Seconds2 [TimeToSec $Time2]
+#
+# We have to do something extra here:
+# In some cases, Time1 is a clock time (i.e. 12:mm:ss for noon), but an old punch stores this as 00:mm:ss; subtracting an hour from this
+# (e.g. for a daylight savings timeshift) needs to rollover correctly. So, we check whether we would get a negative time from this 
+# subtraction, and whether the hours of Time1 is 00, and if so, convert Time1 hours to 12.
+if {$Seconds1 < $Seconds2} {
+  # We will be getting a negative time result here unless we do something.
+  # Check whether we have a situation which looks like at old punch recording 12:00 as 00:00
+  set SplitStr [split $Time1 :]
+  if {[llength $SplitStr] == 3 && [lindex $SplitStr 0] == "00"} {
+    # We are going to fix this by adding 12 hours to Time1 (effectively converting 00:mm:ss to 12:mm:ss).
+    set NewTime1 [TimeAdd $Time1 "12:00:00"]
+    set Seconds1 [TimeToSec $NewTime1]
+    } else {
+    ErrorMsg "WARNING: Negative time result from $Time1 - $Time2. Be suspicious of results."
+    }
+  }
+# Done messing around with the 00 -> 12 checking
+#
 set Diff [expr {$Seconds1 - $Seconds2}]
 return [SecToTime $Diff]
 # If we wanted, we could write the ugly:
@@ -809,6 +880,10 @@ if {[string first "No.,Read at,SI-Card" $line] != -1} {
   # Download box header line; observed 12/09/23
   return 1
   }
+if {[string first "No,Read at,SIID" $line] != -1} {
+  # Download box header line; observed 15/11/09
+  return 1
+  }
 
 
 # Doesn't match any pattern of a "skippable" line.
@@ -845,7 +920,7 @@ return 0
 #
 
 proc ReadNumToName { {fname "DefaultFileRequestor"} } {
-global NameLookup
+global NameLookup debug
 
 # If no arguments, give file requestor; allow file selection
 #   else, pass through with file taken from argument
@@ -879,6 +954,7 @@ if [catch {open $numtonamefilename r} numtonamefilehandle] {
   close $numtonamefilehandle
   }
 
+if {$debug >= 3} {puts "Leaving ReadNumToName"}
 }
 
 #------------------------------------------------------------------------------------------------------
@@ -906,6 +982,7 @@ if {$newAMeetNumEvents > $AMeetNumEvents} {
           set Comp(ResultPlace,$i,$name) ""
           set Comp(ResultEPlace,$i,$name) ""
           set Comp(ResultTime,$i,$name) ""
+          set Comp(ResultScore,$i,$name) 0
           set Comp(ResultClass,$i,$name) ""
           set Comp(ResultClassIdx,$i,$name) ""
           } ;# if (default values exist)
@@ -995,6 +1072,7 @@ if [catch {open $fname r} fnamefilehandle] {
       set db(TotalTime,$Neg)       ""
       set db(EditResult,$Neg)      ""
       set db(FinalResult,$Neg)     "NOI"
+      set db(FinalScore,$Neg)      0
       set db(Course,$Neg)          -1		;# For now. Will set a value below.
       set db(Finished,$Neg)        0
       set db(NumCPunches,$Neg)     0
@@ -1022,6 +1100,7 @@ if [catch {open $fname r} fnamefilehandle] {
         set Comp(ResultPlace,$i,$name) ""	;# Default
         set Comp(ResultEPlace,$i,$name) ""	;# Default
         set Comp(ResultTime,$i,$name) ""	;# Default
+        set Comp(ResultScore,$i,$name) 0	;# Default
         set Comp(ResultClass,$i,$name) ""	;# Default
         set Comp(ResultClassIdx,$i,$name) ""	;# Default
         incr i
@@ -1105,6 +1184,7 @@ if [catch {open $fname r} fnamefilehandle] {
       set db(TotalTime,$Neg)       ""
       set db(EditResult,$Neg)      ""
       set db(FinalResult,$Neg)     "NOI"
+      set db(FinalScore,$Neg)      0
       set db(Course,$Neg)          -1		;# For now. Will set a value below.
       set db(Finished,$Neg)        0
       set db(NumCPunches,$Neg)     0
@@ -1132,6 +1212,7 @@ if [catch {open $fname r} fnamefilehandle] {
         set Comp(ResultPlace,$i,$name) ""	;# Default
         set Comp(ResultEPlace,$i,$name) ""	;# Default
         set Comp(ResultTime,$i,$name) ""	;# Default
+        set Comp(ResultScore,$i,$name) 0	;# Default
         set Comp(ResultClass,$i,$name) ""	;# Default
         set Comp(ResultClassIdx,$i,$name) ""	;# Default
         if {$debug >= 3} {puts "   $Comp(SICard,$i,$name) $Comp(Class,$i,$name)"}
@@ -1276,6 +1357,7 @@ if {[regexp {^EventResult(A|E)(.*).csv$} $fname match eventtype eventnum]} {
             "E" {set Comp(ResultEPlace,$eventnum,$name) $place}
             }
           set Comp(ResultTime,$eventnum,$name) $time
+          # Eventually need to set up another field, for reading in a score. Leave at the default of 0, for now. TODO
           set Comp(ResultClass,$eventnum,$name) $CurrentClass
           # RNOW 
           # I am not certain we really want the original index for the class; it seem the name is more useful.
@@ -1905,17 +1987,20 @@ foreach line $rawfinishlist {
 proc ReadCourses { {fname "DefaultFileRequestor"} } {
 global workingdir coursefilename
 global NumCourses CourseName CourseNames CourseControls CourseLength 
-global CourseAllowedSkips ControlSkippable ControlThrownOut
+global CourseAllowedSkips ControlSkippable ControlThrownOut RemoveLeg MaxRemoveLegTime
 global CourseType ControlValue CourseTimePenalty
 global HTMLTitle
 global AMeetMode AMeetEvent AMeetNumEvents
 global NameFieldLen NameFieldLenDefault
 global OutputColName OutputColumnName OutputColumnHeaders OutputColString NumOutputColumns UseOutputColumns OutputEvents OutColumnToSortBy
+global DoubleEligColumn ARDFTitleKludge
 global GTGCourse
+global debug
 
 # If no arguments, give file requestor; allow file selection
 #   else, pass through with file taken from argument
 
+if {$debug >=3} {puts "In ReadCourses"}
 if {$fname eq "DefaultFileRequestor"} {
 # If we get here, ReadCourses was either called with no arguments,
 # or with our strange default value. Throw up a file requestor for 
@@ -1983,10 +2068,29 @@ if [catch {open $coursefilename r} coursefilehandle] {
       # Possible commands to follow the @:
       #
       #   skip <control number>
+      #		"Skip" makes the given control optional.  It does not correct for time in any way; it has the same effect 
+      #		as would removing the control number from all courses on which it appears.
       #   throwout <control number>
       #   throwout <control number> <course>
+      #		"Throwout" removes the time for legs before and after the given control, as well as treating the thrown control as 
+      #		optional. This option is to be used when a control is misplaced or missing, and the objective is to neither 
+      #		penalize people who spend time looking for the bad control, nor those who may have skipped it entirely. Time is 
+      #		effectively stopped at the last good control, then restarted at the next good control after the thrown one(s). 
+      #   removeleg <control number 1> <control number 2>
+      #   removeleg <control number 1> <control number 2> <course>
+      #		"Removeleg" will remove the time for the leg from control 1 to control 2. The named controls are NOT optional.
+      #		This is useful if there is a desire to stop the clock at a point on the course (e.g. in order to safely carry 
+      #		out some road or river crossing, etc) and then restart the clock on the other side. 
+      #         Note that <control number 1> can be "Start" (or S/start/START), and <control number 2> can be "Finish" (F/finish/FINISH).
+      #         Todo: Implement zeroing the time for a control to finish leg.
+      #   maxremovelegtime <time>
+      #         Maximum amount of time to remove for a "removeleg"; any time over this amount on such a leg will be counted.
+      #         The same maximum will apply for all such legs on a course; it is not currently possible to specify different
+      #         maxremovelegtime's for different legs to be removed.
+      #         TODO
       #   value <control number> <point value>
       #   value <cn1>,<cn2>,...,<cnN> <point value>
+      #		Assign a point value to a control (or list of controls) to be used for Score-O.
       #   timeshift TODO
       #   htmltitle <title>
       #   ameet     
@@ -2027,6 +2131,53 @@ if [catch {open $coursefilename r} coursefilehandle] {
           ErrorMsg "Course file error. Problem with throwout control, not enough information on this line: $line"
           }
       #
+      # REMOVELEG
+# WORKB
+        } elseif {[lindex $worklinelist 0] eq "@removeleg"} {
+        if {[llength $worklinelist] == 3} {
+          set Control1 [lindex $worklinelist 1]
+          if { $Control1 eq "S" || $Control1 eq "start" || $Control1 eq "START"} {
+            # Give a consistent value for "Start"
+            set Control1 "Start"
+            }
+          set Control2 [lindex $worklinelist 2]
+          if { $Control2 eq "F" || $Control2 eq "finish" || $Control2 eq "FINISH"} {
+            # Give a consistent value for "Finish"
+            set Control2 "Finish"
+            }
+          if {$debug >= 3} {puts "Remove leg from: $Control1  to: $Control2"}
+          set RemoveLeg($Control1,$Control2,All) "yes"
+          ErrorMsg "Will remove time from leg $Control1 to $Control2, up to $MaxRemoveLegTime"
+          } elseif {[llength $worklinelist] > 3} {
+          set Control1 [lindex $worklinelist 1]
+          if { $Control1 eq "S" || $Control1 eq "start" || $Control1 eq "START"} {
+            # Give a consistent value for "Start"
+            set Control1 "Start"
+            }
+          set Control2 [lindex $worklinelist 2]
+          if { $Control2 eq "F" || $Control2 eq "finish" || $Control2 eq "FINISH"} {
+            # Give a consistent value for "Finish"
+            set Control2 "Finish"
+            }
+#          set RemoveOnCourse [string range $line [expr [string first " " $line 10] +1] end]		(This is how we would grab even complex course names)
+          set RemoveOnCourse [lindex $worklinelist 3]		;# Go simple for now
+          if {$debug >= 3} {puts "Remove leg from: $Control1 to: $Control2 on course $RemoveOnCourse"}
+          set RemoveLeg($Control1,$Control2,$RemoveOnCourse) "yes"
+          ErrorMsg "Will remove leg from $Control1 to $Control2 on course $RemoveOnCourse"
+          } else {
+          ErrorMsg "Course file error. Problem with removeleg control, not enough information on this line: $line"
+          }
+      #
+      # MAXREMOVELEGTIME
+        } elseif {[lindex $worklinelist 0] eq "@maxremovelegtime"} {
+        if {[llength $worklinelist] == 2} {
+          set MaxRemoveLegTime [string range $line 18 end]
+          ErrorMsg "Will remove leg time(s) up to $MaxRemoveLegTime"
+          } else {
+          ErrorMsg "ERROR: Course file error, problem with maxremovelegtime value. Expect @maxremovelegtime <time>. Problem line: $line"
+          }
+        # TODO
+      #
       # VALUE
         } elseif {[lindex $worklinelist 0] eq "@value"} {
         if {[llength $worklinelist] == 3} {
@@ -2046,7 +2197,6 @@ if [catch {open $coursefilename r} coursefilehandle] {
       # HTMLTITLE
         } elseif {[lindex $worklinelist 0] eq "@htmltitle"} {
         set HTMLTitle [string range $line 11 end]
-        # ErrorMsg "Entering A-Meet mode."
       #
       # AMEET
         } elseif {[lindex $worklinelist 0] eq "@ameet"} {
@@ -2077,6 +2227,7 @@ if [catch {open $coursefilename r} coursefilehandle] {
       #
         } elseif {[lindex $worklinelist 0] eq "@defevent" } {
 #        set worklinelist [SplitOnSpace $line]		;# Use the quotable split
+        if {$debug>=3} {puts "In DefEvent"}
         if {[llength $worklinelist] < 2} {
           ErrorMsg "ERROR: Must at least define an event number:  $line"
           } else {
@@ -2088,8 +2239,12 @@ if [catch {open $coursefilename r} coursefilehandle] {
           set CurrentEvent $num
           ClearCourse
           if {[llength $worklinelist] == 2} {
+            if {$debug>=3} {puts "eq 2."}
             set OutputColName($num) "Event $num"		;# Name defaults to Event N
+            set OutputColString($num) $num			;# Default to just output the current event
+            set UseOutputColumns($num) 0
             } else {
+            if {$debug>=3} {puts "gt 2."}
             set OutputColName($num) [lindex $worklinelist 2]
             if {[llength $worklinelist] == 3} {
               set OutputColString($num) $num		;# Default to just output the current event
@@ -2103,6 +2258,7 @@ if [catch {open $coursefilename r} coursefilehandle] {
           # we know what the current event is.
           # puts "DEFEVENT. Event: $CurrentEvent. Name: $OutputColName($num). OutputString: $OutputColString($num)."
           } 
+        if {$debug>=3} {puts "End DefEvent"}
       # DEFCOLNAMES
       #
         } elseif {[lindex $worklinelist 0] eq "@defcolnames" } {
@@ -2119,6 +2275,15 @@ if [catch {open $coursefilename r} coursefilehandle] {
             incr col
             }
           }
+      # DOUBLEELIGCOLUMN
+      #
+        } elseif {[lindex $worklinelist 0] eq "@doubleeligcolumn" } {
+        set DoubleEligColumn 1
+      # ARDRSPECIALHEADER
+      #
+        } elseif {[lindex $worklinelist 0] eq "@ardfspecialheader" } {
+        set DoubleEligColumn 1
+        set ARDFTitleKludge 1
       #
       # (DEFAULT)
         } else {
@@ -2128,6 +2293,7 @@ if [catch {open $coursefilename r} coursefilehandle] {
 
       } else {
       # Hopefuly this is a normal course line. (If not, we will have an error.)
+      if {$debug>=3} {puts "Working on line $line"}
       set worklinelist [split $line =]
       if {[llength $worklinelist] == 3} {
         if {$CurrentEvent == 0} { set CurrentEvent 1 }
@@ -2141,7 +2307,7 @@ if [catch {open $coursefilename r} coursefilehandle] {
           set CourseControls($NumCourses) [lreplace $CourseControls($NumCourses) $pos $pos]	;# Remove "score" from the controls list
           set CourseType($NumCourses) 1			;# Score-O RNOWS
           # Now, do an early check on the validity of the Time Penalty string. Expect an odd number of comma separated fields in that string.
-          if { [expr {[llength [split [lindex $worklinelist 2] ,]] % 2}] != 1} {
+          if { [lindex $worklinelist 2] ne "" && [expr {[llength [split [lindex $worklinelist 2] ,]] % 2}] != 1} {
             ErrorMsg "ERROR: Expect an odd number of comma separated elements in Time Penalty string. $CourseName($NumCourses): [lindex $worklinelist 2]"
             }
           }
@@ -2163,17 +2329,25 @@ if [catch {open $coursefilename r} coursefilehandle] {
       } ;# else. Normal course line
 
     } ;# foreach line
+  if {$debug>=3} {puts "End of line processing in ReadCourses"}
   close $coursefilehandle
   if {$CurrentEvent == 0} {
     ErrorMsg "WARNING: No courses defined."
     } else {
+    if {$debug>=3} {puts "RC1"}
     SetEvNCourseFromCourse $CurrentEvent
+    if {$debug>=3} {puts "RC2"}
     if {$AMeetEvent == 0} { set AMeetEvent $CurrentEvent }	;# Use the last read course (or the only read course) as the default. 
+    if {$debug>=3} {puts "RC3"}
     SetCourseFromEvNCourse $AMeetEvent
+    if {$debug>=3} {puts "Rc4"}
     SetupOutputCols $AMeetEvent
+    if {$debug>=3} {puts "RC5"}
     }
   set GTGCourse 1
+  if {$debug>=3} {puts "RC6"}
   BuildCourseEditMenu $CourseNames
+  if {$debug>=3} {puts "RC7"}
   } ;# (opened file)
 
 # Try to use this file's dir as a working dir if we don't already have one
@@ -2181,13 +2355,16 @@ if {$workingdir eq ""} {
   SetWorkingDirectory [file dirname $coursefilename]
   }
 
+if {$debug>=3} {puts "Getting ready to test process"}
 # Try to process 
 if {$fname eq "DefaultFileRequestor"} {
   # Only try to process in this case; otherwise, this proc was called from somewhere 
   # which will call the processing itself.
+  if {$debug>=3} {puts "Calling TryToProcess from ReadCourses"}
   TryToProcess
   }
 
+if {$debug>=3} {puts "Ending ReadCourses"}
 }
 
 
@@ -2197,6 +2374,7 @@ if {$fname eq "DefaultFileRequestor"} {
 
 proc TryToProcess { {Startfrom 0} } {
 global GTGRaw GTGCourse
+global debug
 # Check whether we have a raw datafile in memory
 # Check whether we have a course description in memory
 # (Don't worry about having a working directory; this is problem for output routine.)
@@ -2204,7 +2382,9 @@ global GTGRaw GTGCourse
 #
 # The one optional (defaults to 0) argument argument to this routine is the Startfrom,
 # which is passed to ProcessRaw directly.
+if {$debug >= 3} {puts "In TryToProcess"}
 if {$GTGRaw && $GTGCourse} {
+  if {$debug >= 3} {puts "Will ProcessRaw now ..."}
   ProcessRaw $Startfrom
   }
 
@@ -2346,6 +2526,7 @@ foreach line $rawlist {
     set db(TotalTime,$index) ""
     set db(EditResult,$index) ""	;# Note: A null value here, "", indicates that no edit has been made.
     set db(FinalResult,$index) "NOI"	;# No Information
+    set db(FinalScore,$index) 0
     set db(Course,$index) -1
     # Do sanity checking on time values. Correct what is possible (12->24hr, etc).
     if {$debug >= 4} {puts "Calling DoSanityCheck"}
@@ -2476,7 +2657,7 @@ if {[info exists NameFieldLen($db(Course,$index))]} {
 proc ClearCourse {} {
 global NumCourses CourseName CourseNames
 global CourseControls CourseLength CourseType CourseTimePenalty 
-global CourseAllowedSkips ControlSkippable ControlThrownOut
+global CourseAllowedSkips ControlSkippable ControlThrownOut RemoveLeg
 # Clear the current, working course (presumably in preparation of reading in again).
 set NumCourses 0
 set CourseName(-1) "Unknown"
@@ -2484,16 +2665,18 @@ set CourseNames {}
 if [info exists CourseControls]     { array unset CourseControls }
 if [info exists CourseLength]       { array unset CourseLength }
 if [info exists CourseType]         { array unset CourseType }
+set CourseType(-1) 0
 if [info exists CourseTimePenalty]  { array unset CourseTimePenalty }
 if [info exists CourseAllowedSkips] { array unset CourseAllowedSkips }
 if [info exists ControlSkippable]   { array unset ControlSkippable }
 if [info exists ControlThrownOut]   { array unset ControlThrownOut }
+if [info exists RemoveLeg]          { array unset RemoveLeg }
 }
 
 proc ClearEvNCourse { event } {
 global EvNNumCourses EvNCourseName EvNCourseNames
 global EvNCourseControls EvNCourseLength EvNCourseType EvNCourseTimePenalty 
-global EvNCourseAllowedSkips EvNControlSkippable EvNControlThrownOut
+global EvNCourseAllowedSkips EvNControlSkippable EvNControlThrownOut EvNRemoveLeg
 set EvNNumCourses($event) 0
 set EvNCourseName($event,-1) "Unknown"
 set EvNCourseNames($event) {}
@@ -2539,15 +2722,21 @@ foreach index [array names ControlThrownOut] {
     array unset ControlThrownOut($index)
     }
   }
+foreach index [array names RemoveLeg] {
+  regexp {(.+),(.+),(.+)} $index match indexevent indexcontrol indexcourse
+  if {$indexevent == $event} {
+    array unset RemoveLeg($index)
+    }
+  }
 }
 
 proc SetEvNCourseFromCourse { event } {
 global NumCourses CourseName CourseNames
 global CourseControls CourseLength CourseType CourseTimePenalty 
-global CourseAllowedSkips ControlSkippable ControlThrownOut
+global CourseAllowedSkips ControlSkippable ControlThrownOut RemoveLeg
 global EvNNumCourses EvNCourseName EvNCourseNames
 global EvNCourseControls EvNCourseLength EvNCourseType EvNCourseTimePenalty 
-global EvNCourseAllowedSkips EvNControlSkippable EvNControlThrownOut
+global EvNCourseAllowedSkips EvNControlSkippable EvNControlThrownOut EvNRemoveLeg
 set EvNNumCourses($event)    $NumCourses
 set EvNCourseName($event,-1) $CourseName(-1)
 set EvNCourseNames($event)   $CourseNames
@@ -2565,15 +2754,18 @@ foreach index [array names ControlSkippable] {
 foreach index [array names ControlThrownOut] {
   set EvNControlThrownOut($event,$index) $ControlThrownOut($index)	;# Note that index here will be a $n,$c like variable
   }
+foreach index [array names RemoveLeg] {
+  set EvNRemoveLeg($event,$index) $RemoveLeg($index)			;# Note that index here will be a $n1,$n2,$c like variable
+  }	
 }
 
 proc SetCourseFromEvNCourse { event } {
 global NumCourses CourseName CourseNames
 global CourseControls CourseLength CourseType CourseTimePenalty 
-global CourseAllowedSkips ControlSkippable ControlThrownOut
+global CourseAllowedSkips ControlSkippable ControlThrownOut RemoveLeg
 global EvNNumCourses EvNCourseName EvNCourseNames
 global EvNCourseControls EvNCourseLength EvNCourseType EvNCourseTimePenalty 
-global EvNCourseAllowedSkips EvNControlSkippable EvNControlThrownOut
+global EvNCourseAllowedSkips EvNControlSkippable EvNControlThrownOut EvNRemoveLeg
 #
 ClearCourse
 set NumCourses     $EvNNumCourses($event)
@@ -2599,6 +2791,13 @@ foreach index [array names EvNControlThrownOut] {
     set ControlThrownOut($indexcontrol,$indexcourse) $EvNControlThrownOut($indexevent,$indexcontrol,$indexcourse)
     }
   }
+foreach index [array names EvNRemoveLeg] {
+  regexp {(.+),(.+),(.+),(.+)} $index match indexevent indexcontrol1 indexcontrol2 indexcourse
+  if {$indexevent == $event} {
+    set RemoveLeg($indexcontrol1,$indexcontrol2,$indexcourse) $EvNRemoveLeg($indexevent,$indexcontrol1,$indexcontrol2,$indexcourse)
+    }
+  }
+
 }
 
 proc DisconnectCompFromDB {name index} {
@@ -2637,15 +2836,18 @@ global debug
 # When referenced in arrays within the code, cols are numbered starting with 0.
 # The definitions in OutColForName refer to the columns as seen by the user, even though the user will never see this number.
 #
+if {$debug>=3} {puts "In SetupOutputCols"}
 set ColDefList [split $OutputColString($event) ","]
 # ColDefList should contain one element for each column (plus a possible pseudo-column if name placement will be between columns)
 # Each of those elements should be either a single event number, of a summation of events e.g. 2+3
+if {$debug>=3} {puts "In SetupOutputCols, 2"}
 set NumOutputColumns [llength $ColDefList]
 set OutColumnToSortBy [expr $NumOutputColumns - 1]		;# Default to sorting by last column. Count from 0.
 set OutColForNameType "After"
 set OutColForName 0	;# Default to After 0, i.e. placing the name before any place(place)time columns.
 set Column 0
 foreach columndef $ColDefList {
+  if {$debug>=3} {puts "Working on $columndef"}
   # First, check for a name definition. This could result in columndef ending up "" after removing the name (which would make this is a pseudo-column).
   if {[set firstidx [string first "name" $columndef]] != -1} {
     set OutColForName [expr $Column + 1]
@@ -2677,6 +2879,7 @@ foreach columndef $ColDefList {
     } ;# if $columndef ne ""
   } ;# foreach columndef
 if {$debug >= 2} {puts "OutColForName: $OutColForNameType $OutColForName"}
+if {$debug>=3} {puts "Exiting SetupOutputCols"}
 }
 
 proc SetupOutputColResults {index} {
@@ -2695,6 +2898,7 @@ foreach course $db(CourseResults,$index) {
   # We will generate a set of column data for each such course.
   for {set col 0} {$col < $NumOutputColumns} {incr col} {
     set db(ColResult,$course,$col,$index) "init"
+    set db(ColScore,$course,$col,$index) 0	;# Init all scores to default of 0
     foreach event $OutputEvents($col) {
       if {$debug >= 3} {puts "course: $course, col: $col"} 
       if { (($event == $AMeetEvent) || ($UseOutputColumns($AMeetEvent) == 0)) &&  \
@@ -2703,6 +2907,7 @@ foreach course $db(CourseResults,$index) {
         # Just the result of the current download. Might be wrong, for several possible DNF types.
         # We used to generate a psuedotime here; now that is done elsewhere
         set eventtime $db(FinalResult,$index)
+        set eventscore $db(FinalScore,$index)
         if {$debug >= 3} {puts "x2"}
         } else {
         if {$debug >= 3} {puts "y1"}
@@ -2710,17 +2915,26 @@ foreach course $db(CourseResults,$index) {
         if {[info exists Comp(ResultTime,$event,$db(Name,$index))] && \
             ($Comp(ResultClass,$event,$db(Name,$index)) eq $course) } {
           set eventtime $Comp(ResultTime,$event,$db(Name,$index))
+          if {[info exists  Comp(ResultScore,$event,$db(Name,$index))]} {
+            set eventscore $Comp(ResultScore,$event,$db(Name,$index))
+            } else { 
+            set eventscore 0 
+            }
           } else {
           # We don't have an entry in Comp (we would at least have a default value in there), so this is likely a non-registered download
           set eventtime "----"
+          set eventscore 0
           }
         if {$debug >= 3} {puts "y2"}
         }
       if {$debug >= 3} {puts "eventtime: $eventtime"} 
       if {$db(ColResult,$course,$col,$index) eq "init"} {
         set db(ColResult,$course,$col,$index) $eventtime
+        set db(ColScore,$course,$col,$index) $eventscore
         } else {
         set db(ColResult,$course,$col,$index) [TimeAdd $db(ColResult,$course,$col,$index) $eventtime]
+        set db(ColScore,$course,$col,$index) [expr {$db(ColScore,$course,$col,$index) + $eventscore}]
+        # Note that in the event of a Score-O with summation of columns, we sum both the score and the times.
         }
       }
     if {$debug >= 3} {puts "out."}
@@ -3022,11 +3236,56 @@ if {$debug >= 3} {puts "O.Z"}
 
 proc GenerateFinalResult {index} {
 global db AMeetMode OvertimeLimit OutputTimeSinceStart Starttime TimeNow
+global CourseType
+global debug
 # Work out the final result for the runner with the given index.
 # This should take into account everything stored in db (start to finish time, punches, etc), assuming the given course.
 # It should also take into account any stored edit (i.e. db(EditResult,$index)), which overrides any other result.
 # If this is an A-meet, and this is a non-downloaded registered competitor, we might generate a pseudo-time (time since/until start).
 # The final result will be stored in db(FinalResult,$index)
+# For Score-O, the score will be in db(FinalScore,$index). (If not Score-O, this score is set to 0.)
+if {$debug >= 3} {puts "Inside GenerateFinalResult"}
+if {$debug >=4} {puts "a"}
+set db(FinalScore,$index) 0 ;# default score of 0
+if {$debug >=4} {
+  puts "b: start"
+  if {[info exists CourseType($db(Course,$index))] } {
+    puts "It exists"
+    } else {
+    puts "Doesn't exist ... here's your problem..."
+    }
+  if {[info exists db(Name,$index)]} {
+    puts "Name:   $db(Name,$index)"
+    } else {
+    puts "Name doesn't exist."
+    }
+  if {[info exists db(SICard,$index)]} {
+    puts "SICard: $db(SICard,$index)"
+    } else {
+    puts "SICard doesn't exist."
+    }
+  if {[info exists db(Use,$index)]} {
+    puts "Use:    $db(Use,$index)"
+    } else {
+    puts "Use doesn't exist."
+    }
+  if {[info exists db(Course,$index)]} {
+    puts "Course: $db(Course,$index)"
+    } else {
+    puts "Course doesn't exist"
+    }
+  puts "b: end"
+  }
+if {$CourseType($db(Course,$index)) == 1} {
+  if {$debug >=4} {puts "c1a"}
+  set db(FinalScore,$index) [ScoreTotal $index $db(Course,$index)]
+  if {$debug >=4} {puts "c2a"}
+  } else {
+  if {$debug >=4} {puts "c1b"}
+  set db(FinalScore,$index) 0 ;# default score of 0
+  if {$debug >=4} {puts "c2b"}
+  }
+if {$debug >=4} {puts "d"}
 if {$index < 0 && $OutputTimeSinceStart && [info exists Starttime($db(Name,$index))]} {
   # No download, and we should generate a pseudo time since/until start
   if {[TimeCompare $TimeNow $Starttime($db(Name,$index))] == -1} {
@@ -3054,6 +3313,7 @@ if {$index < 0 && $OutputTimeSinceStart && [info exists Starttime($db(Name,$inde
     } ;# if finished
   } ;# if (we need to generate a pseudotime since start)
 # Now that we have done all of that, we might still override the "real" result with a user edit
+if {$debug >=4} {puts "e"}
 if {$db(EditResult,$index) ne ""} {
   # Need to do a check that what is in EditResult is either a real time or a real dnf, just to be sure
   if {[IsTime $db(EditResult,$index)] || [IsDNF $db(EditResult,$index)]} {
@@ -3064,6 +3324,7 @@ if {$db(EditResult,$index) ne ""} {
       }
     }
   }
+if {$debug >= 3} {puts "Leaving GenerateFinalResult"}
 }
 
 proc FixElapsedAndSplitTimes {index} {
@@ -3117,13 +3378,16 @@ if {$debug >= 3} {puts "Leaving FixElapsed"}
 
 proc SetCoursePunchMisc {index Course Finished NumPunched GoodPunches GoodPunchTime} {
 global db 
-global ControlThrownOut CourseName CourseType
+global CourseName CourseType ControlThrownOut RemoveLeg MaxRemoveLegTime
+global debug
 # Since both FindCorrectPunches and GuessCourse need to set similar variables, do both here.
 # We can also calculate the elapsed and split time strings here.
 #
 # Note: There is really no good way to handle a skipped control which immediately follows a control that
 # was thrown out.  We do not try to handle that here. If it happens, the code will likely crash. 
 # However, the case of two (or more) thrown out controls in a row (or otherwise) is handled neatly.
+#
+# See above for the difference between ControlThrownOut and RemoveLeg.
 #
 # First, the easy ones:
 set db(Course,$index)      $Course
@@ -3134,8 +3398,9 @@ set db(CPunchTime,$index)  $GoodPunchTime
 # Now, start working out the misc elapsed and split time lists
 set db(ElapsedTime,$index) {}
 set db(SplitTime,$index) {}
-set LastPunchTime $db(StartTime,$index)
-set ThrownControlsCorrection 0		;# Any time removed due to thrown out controls will be accumulated here.
+set LastPunchTime $db(StartTime,$index)	;# For the loop below. Clock time at which the item previous to the looped punch was clocked at.
+set LastPunchControl "Start"		;# The control number (or "Start") of the item punched prior to the current punch in the loop. For removed legs.
+set ThrownControlsCorrection 0		;# Any time removed due to thrown out controls and removed legs will be accumulated here.
 set InAThrownLeg 0			;# While in a region of the course that was thrown out, set to 1
 foreach PunchTime $db(CPunchTime,$index) Control $db(CPunches,$index) {
   # We need the control only to check if this leg is thrown out.
@@ -3173,14 +3438,32 @@ foreach PunchTime $db(CPunchTime,$index) Control $db(CPunches,$index) {
 #      lappend db(ElapsedTime,$index) [TimeSubtract $LastPunchTime $db(StartTime,$index)]
       lappend db(ElapsedTime,$index) "Throw"
       lappend db(SplitTime,$index) "0:00"
-      } else { ;# this is the normal case, no involvement of thrown legs, etc
+      } else { ;# this is the normal case, no involvement of thrown legs, etc. Might still be a removed leg though.
       if {$PunchTime ne "skip"} {
         # This was a normal punch; $PunchTime should be the time the control was punched.
         # Might want to save some trouble by saving these now in ShortTime form.  TODO
         #
-        # First, currect the current punch time for any thrown out controls
+        # First, check whether this is a leg which is to be removed. If so, adjust the ThrownControlsCorrection as needed.
+# WORKC
+        if {[IsLegRemoved $LastPunchControl $Control $CourseName($Course)] || [IsLegRemoved $LastPunchControl $Control "All"] } {
+          # We will need to fix elapsed (and split time) for this leg up the the maximum.
+          set CorrectedPunchTime [TimeSubtract $PunchTime $ThrownControlsCorrection]
+          set SplitTime [TimeSubtract $CorrectedPunchTime $LastPunchTime]
+          if { [TimeCompare $SplitTime $MaxRemoveLegTime] == -1 } {
+            # SplitTime is less than the max, so remove everything from this leg
+            if {$debug >= 3} {puts "Split less. Remove split.   Split: $SplitTime.  Max: $MaxRemoveLegTime."}
+            set TimeRemoved $SplitTime		
+            } else {
+            if {$debug >= 3} {puts "Split greater. Remove max.  Split: $SplitTime.  Max: $MaxRemoveLegTime."}
+            set TimeRemoved $MaxRemoveLegTime
+            }
+          set ThrownControlsCorrection [TimeAdd $ThrownControlsCorrection $TimeRemoved]		;# Correct future punch times here, along with thrown controls
+          } ;# if IsLegRemoved
+        # Next, correct the current punch time for any thrown out controls. Will included a removed control at this point.
         set PunchTime [TimeSubtract $PunchTime $ThrownControlsCorrection]
-        lappend db(ElapsedTime,$index) [TimeSubtract $PunchTime $db(StartTime,$index)]
+        # The above line adjusts the "punch time" to account for time stoppages due to thrown or removed controls; the punch time used
+        # will be earlier by the amount by which time was to have been stopped for those reasons.
+        lappend db(ElapsedTime,$index)  [TimeSubtract $PunchTime $db(StartTime,$index)]
         lappend db(SplitTime,$index) [TimeSubtract $PunchTime $LastPunchTime]
         set LastPunchTime $PunchTime
         } else {
@@ -3192,6 +3475,7 @@ foreach PunchTime $db(CPunchTime,$index) Control $db(CPunches,$index) {
         }
       } ;# if the next control is thrown
     } ;# if InAThrownLeg
+  set LastPunchControl $Control		;# This is now the "previous" control punched for the next time through the loop.
   } ;# foreach PunchTime
 if {$db(FinishTime,$index) eq ""} {
   # Looks like they didn't punch finish, even though all other controls might be punched.
@@ -3199,6 +3483,23 @@ if {$db(FinishTime,$index) eq ""} {
   # since the person clearly found download and thus the failed finish punch was a fluke. TODO
   # However, for now, we set Finished to false.
   set db(Finished,$index) 0
+  }
+if {[IsLegRemoved $LastPunchControl "Finish" $CourseName($Course)] || [IsLegRemoved $LastPunchControl "Finish" "All"]} {
+  # The last control to Finish is a removed leg. Need to correct here.
+  # First, correct the finish time for the thrown controls correction.
+  set CorrectedFinishTime [TimeSubtract $db(FinishTime,$index) $ThrownControlsCorrection]
+  set SplitTime [TimeSubtract $CorrectedFinishTime $LastPunchTime]
+  # SplitTime is now the time from last control to finish, before accounting for the removal of time up to maxremovelegtime
+  if { [TimeCompare $SplitTime $MaxRemoveLegTime] == -1 } {
+    # SplitTime is less than the max, so remove everything from this leg
+    if {$debug >= 3} {puts "Split less. Remove split.   Split: $SplitTime.  Max: $MaxRemoveLegTime."}
+    set TimeRemoved $SplitTime		
+    } else { 
+    if {$debug >= 3} {puts "Split greater. Remove max.  Split: $SplitTime.  Max: $MaxRemoveLegTime."}
+    set TimeRemoved $MaxRemoveLegTime
+    }
+  set ThrownControlsCorrection [TimeAdd $ThrownControlsCorrection $TimeRemoved]			;# Correct future punch times here, along with thrown controls
+  # Now, just let the adjusted ThrownControlsCorrection handle the final calculations
   }
 if {$db(Finished,$index)} {
   # Work out the final split/elapsed for the leg to the finish
@@ -3226,6 +3527,16 @@ global db NumCourses CourseName CourseControls CourseType CourseAllowedSkips Con
 #    or 
 # If handed course:  Return these values in a big return list.
 
+# Bug: 
+# The following case will not be handled correctly: A looped course with 
+# an allowable skip, where the skip is used for the first visit to a repeated
+# control. This code will ignore the controls visited in the loop (i.e. the
+# valid controls visited following the skipped control) and use the 2nd visit 
+# to the control as though it were the first visit.
+#
+# Order of items has been shuffled (but not checked): Should go with 
+# a "skippable control" or "thrown out control" before using up an allowable skip.
+
 if {$course == -1} {
   # Looks like a default course. Use what is stored for this entry in db.
   set CourseIndex $db(Course,$index)
@@ -3242,24 +3553,12 @@ if {$CourseType($CourseIndex) == 0} {
   set NumToPunch [llength $CourseControls($CourseIndex)]
   set AllowedSkipsLeft $CourseAllowedSkips($CourseIndex)
   foreach Control $CourseControls($CourseIndex) {
-    # Once skipped controls are coded for, this will be where the skip occurs
     # Now, checking from the point of the last good punch, look for the next needed punch on this course
     if { [set NewPunch [lsearch -start $PunchIndex $db(RealPunches,$index) $Control]] != -1} {
       # Good punch; continue
       set PunchIndex $NewPunch
       lappend GoodPunches $Control
       lappend GoodPunchTime [lindex $db(RealPunchTime,$index) $PunchIndex]
-      incr NumPunched
-      if {$NumPunched == $NumToPunch} {
-        # Looks like they finished this course. Can wrap things up now
-        set Finished 1
-        }
-      } elseif {$AllowedSkipsLeft > 0} {
-      # Didn't punch, but the runner is still allowed a skip. This will use up one of our allowed skipped controls.
-      incr AllowedSkipsLeft -1		;# decriment by one, e.g. "use up" one skip
-      # Don't change PunchIndex, since we haven't punched anything for this control
-      lappend GoodPunches $Control	;# Treat a valid skip as a good punch, e.g. act as though we punched it
-      lappend GoodPunchTime "skip"
       incr NumPunched
       if {$NumPunched == $NumToPunch} {
         # Looks like they finished this course. Can wrap things up now
@@ -3282,6 +3581,17 @@ if {$CourseType($CourseIndex) == 0} {
       # This control was thrown out, and is thus skippable.
       # This control is effectively optional. Just treat it as a good, skipped control.
       # This isn't counted as a "skip" for the course.
+      # Don't change PunchIndex, since we haven't punched anything for this control
+      lappend GoodPunches $Control	;# Treat a valid skip as a good punch, e.g. act as though we punched it
+      lappend GoodPunchTime "skip"
+      incr NumPunched
+      if {$NumPunched == $NumToPunch} {
+        # Looks like they finished this course. Can wrap things up now
+        set Finished 1
+        }
+      } elseif {$AllowedSkipsLeft > 0} {
+      # Didn't punch, but the runner is still allowed a skip. This will use up one of our allowed skipped controls.
+      incr AllowedSkipsLeft -1		;# decriment by one, e.g. "use up" one skip
       # Don't change PunchIndex, since we haven't punched anything for this control
       lappend GoodPunches $Control	;# Treat a valid skip as a good punch, e.g. act as though we punched it
       lappend GoodPunchTime "skip"
@@ -3335,6 +3645,7 @@ global AMeetMode AMeetEvent Comp
 set Finished 0			;# Boolean
 set BestGuessCourse -1		;# Will still be -1 at end if didn't punch any controls
 set NumPunchedOnBestMatchCourse 0 ;# Num punched on the best match of course
+set FinishedBestMatchCourse 0	;# Did they finish the course with the best match so far?
 set BestScore -9999999999	;# Best score so far. Let us hope noone ever gets a score this low.
 set BestScoreOn -1		;# Index of course with best score-o score
 set CourseFromRegistration 0	;# Course was derived from registration information
@@ -3360,6 +3671,7 @@ if {$AMeetMode && [info exists Comp(Class,$AMeetEvent,$db(Name,$index))]} {
     set NumToPunch [llength $CourseControls($CourseIndex)]
     set BestGuessCourse $CourseIndex
     set NumPunchedOnBestMatchCourse $NumPunched
+    set FinishedBestMatchCourse $Finished
     set OfficialPunches $GoodPunches
     set OfficialPunchTime $GoodPunchTime
     set CourseFromRegistration 1
@@ -3381,9 +3693,10 @@ if {!$Finished} {
     set GoodPunches   [lindex $cplist 2]	;# List of all valid punches on course being checked
     set GoodPunchTime [lindex $cplist 3]	;# List of times associated with GoodPunches
     set NumToPunch [llength $CourseControls($CourseIndex)]
-    if {$Finished && ($NumPunched > $NumPunchedOnBestMatchCourse)} {
+    if {$Finished && (($NumPunched > $NumPunchedOnBestMatchCourse) || !$FinishedBestMatchCourse)} {
       set BestGuessCourse $CourseIndex
       set NumPunchedOnBestMatchCourse $NumPunched
+      set FinishedBestMatchCourse 1
       set OfficialPunches $GoodPunches
       set OfficialPunchTime $GoodPunchTime
       #puts "Changing C1 $db(Name,$index)'s course to $CourseName($CourseIndex)"
@@ -3398,6 +3711,7 @@ if {!$Finished} {
         # ... then this is our best guess (so far) for the course this runner was intending to run
         set BestGuessCourse $CourseIndex
         set NumPunchedOnBestMatchCourse $NumPunched
+        set FinishedBestMatchCourse 0
         set OfficialPunches $GoodPunches
         set OfficialPunchTime $GoodPunchTime
         #puts "Changing C2 $db(Name,$index)'s course to $CourseName($CourseIndex)"
@@ -3819,6 +4133,38 @@ return 1
 }
 
 #------------------------------------------------------------------------------------------------------
+# Build Place Number lists
+#
+
+proc BuildPlaceNumberList {FinishList} {
+global db CourseType
+# This routine is handed a list of indices, already sorted into place, but with possible ties.
+# It returns a list of place numbers, e.g. 1 2 3 4, or 1 2 2 4 (for a 2nd place tie).
+set place 1	;# Start with 1st place.
+set OutList {}  ;# Start with an empty output list
+set increment 1 ;# We use this to track the extra increment after ties occur, so places look like 1 2 2 4, not 1 2 2 3
+# Loop through the finish list, comparing each item with the next, looking for ties.
+# We will always use "place" for the place of the index we are looking at; the only question is whether to 
+# increment place or keep it the same in preparation for moving to the next index.
+for {set index 0} {$index < [expr {[llength $FinishList] - 1}]} {incr index} {
+  lappend OutList $place
+  if {[CompareResults [lindex $FinishList $index] [lindex $FinishList [expr {$index + 1}]]] == -1} {
+    set place [expr {$place + $increment} ]
+    set increment 1	;# Now go back to normal increments of 1
+    # Note: We really need to increment by more than 1 if there were ties before now.
+    } elseif {[CompareResults [lindex $FinishList $index] [lindex $FinishList [expr {$index + 1}]]] == 0}   {
+    # Do nothing; the next place will be the same as the current place, because there is a tie.
+    # OK, not really "nothing"; we need to increment the number of ties which has occurred.
+    incr increment	;# This will cause us to skip one place for every tie that occurs
+    } else {
+    ErrorMsg "Error: FinishList not sorted correctly."
+    }
+  }
+lappend OutList $place	;# Have to add the place for the final item, but no need to check for incrementing now.
+return $OutList
+}
+
+#------------------------------------------------------------------------------------------------------
 # Compare results
 #
 
@@ -3855,21 +4201,29 @@ if {$CourseType($db(Course,$r1)) == 0} {
     }
   } elseif {$CourseType($db(Course,$r1)) == 1} {
   # Score-O
-  set s1 [ScoreTotal $r1]
-  set s2 [ScoreTotal $r2]
-  if {$s1 > $s2} {
-    return "-1"
-    } elseif {$s2 > $s1}  {
-    return "1"
-    } else {
-    # Same score, sort by total time
-    if {[info exists db(TotalTime,$r1)] && [info exists db(TotalTime,$r2)]} {
-      return [TimeCompare $db(TotalTime,$r1) $db(TotalTime,$r2)]
+  if {![IsDNF $db(FinalResult,$r1)] &&  [IsDNF $db(FinalResult,$r2)]} { return "-1" }
+  if {![IsDNF $db(FinalResult,$r2)] &&  [IsDNF $db(FinalResult,$r1)]} { return  "1" }
+  if {![IsDNF $db(FinalResult,$r1)] && ![IsDNF $db(FinalResult,$r2)]} {
+    # Both finished
+    set s1 [ScoreTotal $r1]
+    set s2 [ScoreTotal $r2]
+    if {$s1 > $s2} {
+      return "-1"
+      } elseif {$s2 > $s1}  {
+      return "1"
       } else {
-      # Someone's time doesn't exist (possibly didn't punch finish). Just return an equal result.
-      return "0"
+      # Same score, sort by total time
+      if {[info exists db(TotalTime,$r1)] && [info exists db(TotalTime,$r2)]} {
+        return [TimeCompare $db(TotalTime,$r1) $db(TotalTime,$r2)]
+        } else {
+        # Someone's time doesn't exist (possibly didn't punch finish). Just return an equal result.
+        return "0"
+        }
       }
-    }
+    } else {
+    # Neither finished. Just return an equal result.
+    return "0"
+    } ;# if both finished
   } ;# if course type
 }
 
@@ -3903,9 +4257,11 @@ if {$courseindex == -1} {
 
 # Now, lookup the results we are comparing for runner indices r1 and r2. 
 # For a regular course, these will be either a time or some form of DNF. 
-# For a score-o, these will be a score or DNF (if they didn't actually compete in the score-o, for example).
+# For a score-o, need to check for DNF (may have not started/finished the event), then compare based on score first, then time.
 set result1 $db(ColResult,$OCCoursename,$OCCol,$r1)
 set result2 $db(ColResult,$OCCoursename,$OCCol,$r2)
+set score1 $db(ColScore,$OCCoursename,$OCCol,$r1)
+set score2 $db(ColScore,$OCCoursename,$OCCol,$r2)
 
 # Now, start the comparison
 if {$EvNCourseType($event,$courseindex) == 0} {
@@ -3926,17 +4282,21 @@ if {$EvNCourseType($event,$courseindex) == 0} {
     }
   } elseif {$EvNCourseType($event,$courseindex) == 1} {
   # Score-O
-  # The results are a score, not a time. DNF is still possible (SPW, DNS, etc).
+  # Sort on a score first, then time. DNF is still possible (SPW, DNS, etc).
   if {![IsDNF $result1] &&  [IsDNF $result2]} { return "-1" }
   if {![IsDNF $result2] &&  [IsDNF $result1]} { return  "1" }
+  if { [IsDNF $result1] &&  [IsDNF $result2]} {
+    # Both DNFed
+    return [CompareResults $r1 $r2] 
+    } ;# both dnf
   if {![IsDNF $result1] && ![IsDNF $result2]} {
-    if {$result1 > $result2} {
+    if {$score1 > $score2} {
       return "-1"
-      } elseif {$result2 > $result1}  {
+      } elseif {$score2 > $score1}  {
       return "1"
       } else {
-      # Same score, sort by some other method
-      return "0"	;# TODO
+      # Same score, sort by time
+      return [TimeCompare $result1 $result2]
       }
     }
   } ;# if course type
@@ -3963,11 +4323,13 @@ global LiveUpdates AMeetMode AMeetEvent Comps Comp CourseNames Starttime
 global TimeNow
 global ResultCSVOutput ResultECSVOutput ResultOUSAOutput
 global FinishOrder FinishOrderElig ElapsedTimes ElapsedTimesElig
+global PlaceNumbers PlaceNumbersElig
 global NumOutputColumns UseOutputColumns OutputEvents OutColumnToSortBy OutputColName OutputColumnName OutputColumnHeaders
 global OutColPlace OutColTime OutColPlaceElig OutColTimeElig
 global CompWithNoDL EligCompWithNoDL
 global OvertimeLimit
 global ShowLegend
+global DoubleEligColumn ARDFTitleKludge
 global debug
 # This routine will calculate the final results (runner ranking for each course, detailed split 
 # comparisons, etc) and display them.  
@@ -4148,6 +4510,11 @@ if {$debug >= 3} {puts "preD"}
 # search, find that time as the third element in the list, and know that he is in third place. (Remember that Tcl
 # numbers elements from 0, so 3:45 will show up with an index of 2 if it is the 3rd element in the list.)
 #
+# Alas, the above bit of cleverness won't work as easily for Score-O results. So, for that case, we build another list, derived
+# from the FinishOrder (and FinishOrderElig) to determine place numbers for Score-O:
+#
+# PlaceNumbers($coursename)		The place numbers for each index in FinishOrder. Will normally be 1 2 3..., unless a tie makes it 1 2 2 ...
+# PlaceNumbersElig($coursename)		The place numbers for each index in FinishOrderElig ...
 
 
 if {$debug >= 3} {puts "A"}
@@ -4212,8 +4579,11 @@ if {$debug >= 3} {puts "A.1c"}
 foreach index $OutputIdxs {
   if {$debug >= 3} {puts "  Index: $index"}
   GenerateFinalResult $index	;# This should produce the result output for this index for this event (i.e. Time, Time-since-start, DNF, OVT, user edit, etc)
+  if {$debug >= 3} {puts " a.."}
   lappend FinishOrder($CourseName($db(Course,$index))) $index
+  if {$debug >= 3} {puts " a.."}
   set db(CourseResults,$index) {}
+  if {$debug >= 3} {puts "Just before set col 0 ..."}
   for {set col 0} {$col < $NumOutputColumns} {incr col} {
     # Figure out which courses this person needs a result line for (i.e. may have run Orange yesterday, and Yellow today, so they get a line in each).
     foreach event $OutputEvents($col) {
@@ -4249,7 +4619,21 @@ foreach index $OutputIdxs {
   if {$debug >= 3} {puts "Setup post."}
   # Now, make a second pass, and build each of the finish place lists in each of the needed courses
   # Also, handle the length of names (NameFieldLenCN) adjustments here.
+  if {$debug >= 3} {
+    puts "Getting ready to loop through courses 1. index: $index "
+    if {[info exists db(Name,$index)]} {
+      puts "Getting ready to loop through courses 2. name: $db(Name,$index)"
+      } else {
+      puts "Getting ready to loop through courses 2. name does not exist"
+      } 
+    if {[info exists db(SICard,$index)]} {
+      puts "Getting ready to loop through courses 3. SI: $db(SICard,$index)"
+      } else {
+      puts "Getting ready to loop through courses 3. SICard does not exist"
+      } 
+    }
   foreach course $db(CourseResults,$index) {
+    if {$debug >= 3} {puts "Working on course $course"}
     for {set col 0} {$col < $NumOutputColumns} {incr col} {
       lappend OutColPlace($course,$col) $index
       lappend OutColTime($course,$col) $db(ColResult,$course,$col,$index)
@@ -4269,6 +4653,7 @@ foreach index $OutputIdxs {
         if {$debug >= 3} {puts "Setting NameFieldLenCN b"}
         set NameFieldLenCN($course) $NameFieldLenMax
         }
+      if {$debug >= 3} {puts "Past str len NameFieldLenCN"}
       } ;# if (long name)
     } ;# foreach course
   if {[info exists Comp(Elig,$db(Name,$index))] && $Comp(Elig,$db(Name,$index))} {
@@ -4280,6 +4665,7 @@ foreach index $OutputIdxs {
         }
       }
     }
+  if {$debug >= 3} {puts "Tail of foreach"}
   # Obsolete. This is where this used to be calculated:
   # incr NumStartsTotal	;# Note: We also have starts below, derived from the Start box only
   # Thus, NumStartsTotal is downloads plus undownloaded comps. We always count registered comps as "starts" for these purposes.
@@ -4339,6 +4725,9 @@ foreach coursename $FullCourseNamesList {
   set CourseIndex [lsearch $CourseNames $coursename]
   if {$CourseIndex != -1} {
     set FinishOrder($coursename) [lsort -command CompareResults $FinishOrder($coursename)]
+    set FinishOrderElig($coursename) [lsort -command CompareResults $FinishOrderElig($coursename)]
+    set PlaceNumbers($coursename) [BuildPlaceNumberList $FinishOrder($coursename)]
+    set PlaceNumbersElig($coursename) [BuildPlaceNumberList $FinishOrderElig($coursename)]
     # Loop through the legs on this course (remembering to include the finish leg)
     for {set legnum 0} {$legnum <= [llength $CourseControls($CourseIndex)]} {incr legnum} {
       set ElapsedTimes($coursename,$legnum)     [lsort -command TimeCompare $ElapsedTimes($coursename,$legnum)]
@@ -4442,8 +4831,11 @@ foreach coursename $FullCourseNamesList {
                 LogResult "" }
             } ;# switch
           LogResult "<pre>"
-          if {$CourseType($CourseIndex) == 1} {
+          if {$CourseType($CourseIndex) == 1 && $AMeetMode == 0} {
                 LogResult "    Pnts-Pnlt=Total   Time" 
+            }
+          if {$ARDFTitleKludge == 1} {
+            LogResult [format " USA R-2 All  Score    Time %-*s Controls  " $NameFieldLen($CourseIndex) "Name"]
             }
           # New.
           } else {
@@ -4455,7 +4847,13 @@ foreach coursename $FullCourseNamesList {
             1 { LogResult [format "%s Course: %d KP. Time Penalty: %s" \
                   $CourseName($CourseIndex) [llength $CourseControls($CourseIndex)] [PenaltyToText $CourseTimePenalty($CourseIndex)]] 
                 LogResult ""
-                LogResult "    Pnts-Pnlt=Total   Time" }
+                if {$AMeetMode == 0} {
+                  LogResult "    Pnts-Pnlt=Total   Time" 
+                  }
+                if {$ARDFTitleKludge == 1} {
+                  LogResult [format " USA R-2 All  Score    Time %-*s Controls  " $NameFieldLen($CourseIndex) "Name"]
+                  }
+              }
             } ;# switch
           }
         if {$debug >= 3} {puts "E.4"}
@@ -4523,7 +4921,7 @@ foreach coursename $FullCourseNamesList {
             set RealPunchesString ""
             }
           } ;# if Finished,$index
-      if {$debug >= 3} {puts "F.4"}
+        if {$debug >= 3} {puts "F.4"}
         if {$FinishOrderElig($coursename) == {}} {
           # No elig runners on this course. Don't include the elig place
           LogResult [format "   %3s %-*s %s     %s" $PlaceNum $NameFieldLen($CourseIndex) $db(Name,$index) $ResultString $RealPunchesString] $index
@@ -4535,6 +4933,7 @@ foreach coursename $FullCourseNamesList {
           # Output for EventResults(A/E)N.csv file
           set Comp(ResultPlace,$AMeetEvent,$db(Name,$index)) $PlaceNumCSV
           set Comp(ResultTime,$AMeetEvent,$db(Name,$index))  $ResultStringCSV
+          # TODO set Comp(ResultScore,$AMeetEvent,$db(Name,$index)) $ScoreStringCSV       Need to set up the scorestringcsv above
           set Comp(ResultClass,$AMeetEvent,$db(Name,$index)) $CourseName($CourseIndex)
           set Comp(ResultClassIdx,$AMeetEvent,$db(Name,$index)) $CourseIndex
           lappend ResultCSVOutput [format "%s,%s,%s,%s" $PlaceNumCSV $db(Name,$index) $Comp(Club,$db(Name,$index)) $ResultStringCSV]
@@ -4546,10 +4945,44 @@ foreach coursename $FullCourseNamesList {
         if {$debug >= 3} {puts "F.6"}
         } elseif {$CourseType($CourseIndex) == 1} {
         # Score-O
-        set PlaceNum [expr {[lsearch $FinishOrder($coursename) $index] + 1}]
-        set RealPunchesString $db(RealPunches,$index)
-        LogResult [format "%3s %4s %4s %4s %s %-*s %s" $PlaceNum  [ScorePoints $index] [ScorePenalty $index] [ScoreTotal $index] \
-           $db(TotalTime,$index) $NameFieldLen($CourseIndex) $db(Name,$index) $RealPunchesString] $index
+        if {$AMeetMode == 0} {
+          # Local version of Score-O output
+          set PlaceNum [expr {[lsearch $FinishOrder($coursename) $index] + 1}]
+          set RealPunchesString $db(RealPunches,$index)
+          LogResult [format "%3s %4s %4s %4s %s %-*s %s" $PlaceNum  [ScorePoints $index] [ScorePenalty $index] [ScoreTotal $index] \
+             $db(TotalTime,$index) $NameFieldLen($CourseIndex) $db(Name,$index) $RealPunchesString] $index
+          } else {
+          # A-Meet version of Score-O output TOSCORE
+          if {$debug >= 3} {puts "AMeetMode Score-O Output, index $index"}
+          # Old: set PlaceNum [expr {[lsearch $FinishOrder($coursename) $index] + 1}]
+          if {![IsDNF $db(FinalResult,$index)]} {
+            # Finished, valid result
+            set PlaceNum [lindex $PlaceNumbers($coursename) [lsearch $FinishOrder($coursename) $index]]
+            if {[info exists Comp(Elig,$db(Name,$index))] && $Comp(Elig,$db(Name,$index)) } {
+              set PlaceNumElig [lindex $PlaceNumbersElig($coursename) [lsearch $FinishOrderElig($coursename) $index]]
+              } else {
+              # Not elig
+              set PlaceNumElig ""
+              }
+            set ScoreString [format "%s" $db(FinalScore,$index)]
+            set ResultString [format "%8s" $db(FinalResult,$index)]
+            } else {
+            # Some variety of DNF on the score-o (DNS, DSQ, ...)
+            set PlaceNum ""
+            set PlaceNumElig ""
+            set ScoreString [format "%s" $db(FinalScore,$index)]
+            set ResultString [format "%8s" $db(FinalResult,$index)]
+            }
+          set RealPunchesString $db(RealPunches,$index)
+          if {$DoubleEligColumn == 0} {
+            LogResult [format "%3s %3s   %4s %s %-*s %s" $PlaceNumElig $PlaceNum  $ScoreString \
+               $ResultString $NameFieldLen($CourseIndex) $db(Name,$index) $RealPunchesString] $index
+            } else {
+            # We are using the Double Elig Column kludge.
+            LogResult [format "%3s %3s %3s   %4s %s %-*s %s" $PlaceNumElig $PlaceNumElig $PlaceNum  $ScoreString \
+               $ResultString $NameFieldLen($CourseIndex) $db(Name,$index) $RealPunchesString] $index
+            }
+          }
         } ;# if (course type...)
       if {$debug >= 3} {puts "F.7"}
       } ;# foreach index
@@ -4610,6 +5043,7 @@ if {1} {
 # Loop over all courses a second time. Now outputting the detailed splits results. Skip "Unknown" this time.
 for {set CourseIndex 0} {$CourseIndex < $NumCourses} {incr CourseIndex} {
   set coursename $CourseName($CourseIndex)
+  if {$debug >= 3} {puts "H3a"}
   if {$FinishOrder($coursename) != {}} {
     # We only output headers for courses that someone was on
     LogResult ""
@@ -4643,8 +5077,10 @@ for {set CourseIndex 0} {$CourseIndex < $NumCourses} {incr CourseIndex} {
     LogResult $HeaderStr
     }
   # Now, print the entries, with detailed split information, under this course
+  if {$debug >= 3} {puts "H3.b"}
   foreach index $FinishOrder($coursename) {
     if {$CourseType($CourseIndex) == 0} {
+      if {$debug >= 3} {puts "H3.c"}
       #
       # Normal course splits
       #
@@ -4674,16 +5110,29 @@ for {set CourseIndex 0} {$CourseIndex < $NumCourses} {incr CourseIndex} {
         append OutStr [format "   %6.2f" [expr ([TimeToSec $db(FinalResult,$index)]/60.0) / $CLen]]
         }
       LogResult $OutStr $index
+      if {$debug >= 3} {puts "H3.d"}
       # Second, the splits line --------------------------
       set OutStr [format "%*s" [expr {$NameFieldLen($CourseIndex) + 23}] " "]	;# Just a convenient way to get a bunch of spaces
+      if {$debug >= 3} {puts "H3.d1"}
       set legnum 0
+      if {$debug >= 3} {puts "H3.d2"}
       foreach SplitTime $db(SplitTime,$index) {
+        if {$debug >= 3} {puts "H3.d2a"}
         set SplitPlace [expr {[lsearch $SplitTimes($coursename,$legnum) $SplitTime] + 1}]
+        if {$debug >= 3} {puts "H3.d2b"}
         if {$SplitTime eq "Throw" || $SplitTime eq "Skip" || $SplitTime eq "----" || $SplitTime eq ""} {set SplitPlace ""}
+        if {$debug >= 3} {puts "H3.d2c"}
+        if {$debug >= 3} {puts " SplitTime:  $SplitTime"}
+        if {$debug >= 3} {puts " SplitPlace: $SplitPlace"}
+        if {$debug >= 3} {puts " Name      : $db(Name,$index)"}
         append OutStr [format "%7s%3s" [TimeToShortTime $SplitTime] $SplitPlace]
+        if {$debug >= 3} {puts "H3.d2d"}
         incr legnum
+        if {$debug >= 3} {puts "H3.d2e"}
         }
+      if {$debug >= 3} {puts "H3.d3"}
       LogResult $OutStr $index
+      if {$debug >= 3} {puts "H3.e"}
       # Third, the split delta line ----------------------
       set OutStr [format "%*s" [expr {$NameFieldLen($CourseIndex) + 23}] " "]	;# Just a convenient way to get a bunch of spaces
       set legnum 0
@@ -4692,7 +5141,9 @@ for {set CourseIndex 0} {$CourseIndex < $NumCourses} {incr CourseIndex} {
         append OutStr [format "%7s%3s" [TimeToShortTime $SplitDelta] ""]
         incr legnum
         }
+      if {$debug >= 3} {puts "H3.f"}
       LogResult $OutStr $index
+      if {$debug >= 3} {puts "H3.g"}
       } elseif {$CourseType($CourseIndex) == 1} {
       #
       # Score-O splits
@@ -4754,6 +5205,7 @@ for {set CourseIndex 0} {$CourseIndex < $NumCourses} {incr CourseIndex} {
     # New. 
   } ;# for CourseIndex looping over all courses (except Unknown)
 } ;# if {debug}
+if {$debug >= 3} {puts "H4"}
 
 if {$OutputHTML} {
   LogResult ""

@@ -373,7 +373,4 @@ I would like to hear from you.
 
 
 
-					Ken. Hanson
-					2008/07/31
-					Last revision: 2008/09/16
-
+Ken. Hanson

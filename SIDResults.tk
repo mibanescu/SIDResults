@@ -1,0 +1,1812 @@
+#! /bin/sh
+# Trick. tcl sees next line as a comment continuation, sh does not.  \
+exec wish "$0" ${1+"$@"}
+
+#
+#	SIDResults
+#
+#	Ken. Hanson
+#	Started: 2008/02/27
+#
+#	Release version 0.80, 2008/09/16
+#
+# This program is used to generate web-ready results from an 
+# Orienteering meet managed by e-punch. 
+# In particular, it takes the raw output from an e-punch 
+# results box, as well as a list of control codes defining 
+# each course, and generates a list of results (including 
+# assignment of competators to courses, placement, split times, 
+# etc) in a web-ready format.
+#
+
+# Major Todo:
+#
+# Button to toggle error sections out of the way.
+#
+# Splits: Use mmm:ss 
+# 
+# Duplicate: Check if a "duplicate" is a complete course. May want to raise a warning, since
+# the shorter could be a completed course, while the longer is a second course attemped
+# without first clearing the stick.
+#
+# Directions for making the script run in a standalone mode (or build a standalone wrapper)
+# Allow renaming of SINames files (button, file requestor). 
+# Deal easily with re-renting a stick (i.e. same number, multiple names)
+#   Possibly store all names read for this number, and give menu to select from.
+# Message when changing name from what is stored on stick
+#   Weed out if name on stick contains string "RENTAL"
+# Allow editing of
+#   Artificial start, punch time, finish, etc
+#   Add runner
+# Allow skipping controls
+#   Everyone
+#   By individual
+# Allow score-o format courses
+# Allow comments in SINames (to identify event this file is associated with, for example)
+#
+# Minor Todo:
+# Endless error checking
+# Check for MP (i.e. if didn't finish course, try to match course with single allowed skipped control)
+# Case of someone not clearing, then downloading multiple times (currently doesn't remove multiples if person didn't clear)
+# Allow selection from ErrorMsg log as well as from results window. 
+#   Build refidx list for ErrorMsg region
+#   Add refs to all logs into ErrorMsg
+#   Add selection code for error window
+# Fix the wriggles. (Have partially contained. Would like to eliminate completely.)
+
+# Some globals
+#
+# In default filename settings below, if there are both "...Filename" and "...Filenames" versions, the
+# singular version is obsolete; code will now check for each name in ...Filenames and use the first 
+# such name which exists as a file in the working directory.
+set DefaultRawFilename "RawData.csv"
+set DefaultCourseFilename "courses.txt"
+set DefaultCourseFilenames {"courses.txt" "Courses.txt" "course" "Course" "course.txt" "Course.txt"}
+set DefaultNumToNameFilename "SINames"
+set DefaultNumToNameFilenames {"SINames" "SINames.txt" "SINamesEvent"  "SINamesEvent.txt"}
+set DefaultGlobalNumToNameFNs {"SINames" "SINames.txt" "SINamesGlobal" "SINamesGlobal.txt"}
+set DefaultOutputFilename "Results.txt"
+set DefaultOutputHTMLFilename "Results.html"
+set HTMLTitle "Date, Location"
+
+# Some settings
+set OutputRealPunches 1	;# Whether or not to include the string of punches actually visited
+set HideErrors 0	;# Whether or not to hide the error message window and raw results
+set OutputHTML 0	;# Whether the output is HTML or plain text.
+# Note: If OutputHTML==1, then HideErrors should ==1. 
+# This will be enforced inside CalcResults, but left optional elsewhere.
+
+# Here is a convenient place to keep documentation on the important global variables
+#
+# db(Use,$i)		Boolean. 0: Skip/delete this entry.  1: Normal, this is an active entry
+# db(SICard,$i)		SI Card number 
+# db(Name,$i)		Runner's name
+# db(NumPunches,$i)	Number of real punches registered for this downloaded run
+# db(RealPunches,$i)	List, all control code numbers, in order punched, regardless of course relevance
+# db(RealPunchTime,$i)	List, time of each punch in RealPunches list
+# db(ClearTime,$i)	Time the card was cleared. Used for cleansing duplicate downloads from results.
+# db(ClearCN,$i)	Control number of box used to clear. Used to rule out simul clears from diff boxes.
+# db(StartTime,$i)	Start time, hh:mm:ss form
+# db(FinishTime,$i)	Finish time, hh:mm:ss form
+# db(TotalTime,$i)	FinishTime - StartTime, in hh:mm:ss format, regardless of course finish, etc
+# db(Course,$i)		Index of course assigned to this entry. May be a guess or imposed by user input
+# db(Finished,$i)	Boolean. Did this entry finish the course as set in db(Course,$i)
+# db(NumCPunches,$i)	Number of valid controls punched on the course assigned this entry
+# db(CPunches,$i)	List, control code numbers of punched controls on the course assigned this entry
+# db(CPunchTime,$i)	List, time of each punch in CPunches list
+#			The CPunches list will be basically a cleaned up version of the RealPunches list.
+#			i.e. CPunches will not contain punches not on the course, or punches after 
+#			any skipped control.
+# db(ElapsedTime,$i)	List, elapsed time to each punch in CPunches list, plus finish
+# db(SplitTime,$i)	List, split times for each punch in CPunches list, plus finish
+# db(DelayedWarnings,)	List, any warnings to go to the error log only after duplicates have been cleared. 
+#
+# NameLookup($num)	The name of the person associated with SIcard number $num
+#
+# CourseName($c)	The name of course indexed by $c. Includes an index of -1: "Unknown"
+# CourseNames		A list of all course names. 
+# CourseControls($c)	List, control codes for this course
+# CourseLength($c)	The length of this course, assumed to be in km (for calculating min/km)
+#
+# EditIdx		The entry index of the item currently being edited. -1 if none.
+
+#------------------------------------------------------------------------------------------------------
+# Set up some scrollable areas
+# 
+
+proc ScrolledListbox {f args} {
+frame $f
+listbox $f.list \
+  -xscrollcommand [list ScrollSet $f.xscroll [list grid $f.xscroll -row 1 -column 0 -sticky we]] \
+  -yscrollcommand [list ScrollSet $f.yscroll [list grid $f.yscroll -row 0 -column 1 -sticky ns]]
+eval {$f.list configure} $args
+scrollbar $f.xscroll -orient horizontal -command [list $f.list xview]
+scrollbar $f.yscroll -orient vertical   -command [list $f.list yview]
+grid $f.list -sticky news
+grid rowconfigure $f 0 -weight 1
+grid columnconfigure $f 0 -weight 1
+return $f.list
+}
+
+proc ScrollSet {scrollbar geoCmd offset size} {
+if {$offset != 0.0 || $size != 1.0} {
+  eval $geoCmd  ;# Make sure it is visible
+  }
+$scrollbar set $offset $size
+}
+
+#------------------------------------------------------------------------------------------------------
+# Time handling routines
+#
+
+# All times are strings, in the form of hh:mm:ss
+# The following are all valid: 12:34:56 09:34:56 9:34:56 34:56 4:56 15 03 3
+# Any truncations are assumed off the left end, i.e. will always contain at least one 
+# digit of seconds.
+# If time-of-day, hh will be in 24 hour form.
+# Any time returned will have the same format, with left side 0's changed to spaces
+# i.e. 00:03:08 -> "    3:08"
+
+proc StripLeadingZeros {Time} {
+# Take a time (or integer) and strip leading insignificant characters, i.e. 0's, :'s, etc
+# Leave leading spaces intact (i.e. don't change the length of the string).
+#
+# This is inefficient.  
+# Could do better using regexp matching; do this if performance becomes problematic.
+set FoundSig 0		;# Have we gotten to a significant character yet, i.e. 0-9, ., etc
+set LenLimit [expr [string length $Time] - 1]	;# Don't check last char
+for {set i 0} {$i < $LenLimit} {incr i} {
+  switch -regexp -- [string index $Time $i] {
+    {[ +-]} {}
+    {[0:]} {set Time [string replace $Time $i $i " "]}
+    default {set FoundSig 1}
+    }
+  if {$FoundSig} {break}
+  }
+return $Time
+}
+
+proc TimeToShortTime {Time} {
+# Convert a time string in hh:mm:ss to mmm:ss
+set Seconds [TimeToSec $Time]
+set Minutes [expr {int([expr {$Seconds / 60}])}]
+set Seconds [expr {$Seconds - $Minutes * 60}]
+set Output [format "%03u:%02u" $Minutes $Seconds]
+# Now just strip off the leading 0's (and unneeded ":"'s)
+# Search for the first character not a space, 0, or :
+# then change every character before that one to a space.
+set Output [StripLeadingZeros $Output]
+return $Output
+}
+
+proc TimeToSec {Time} {
+# Convert a time string in hh:mm:ss form to seconds.
+set SplitStr [split $Time :]
+switch [llength $SplitStr] {
+  3 { set Hours [lindex $SplitStr 0]; set Minutes [lindex $SplitStr 1]; set Seconds [lindex $SplitStr 2] }
+  2 { set Hours 0;                    set Minutes [lindex $SplitStr 0]; set Seconds [lindex $SplitStr 1] }
+  1 { set Hours 0;                    set Minutes 0;                    set Seconds [lindex $SplitStr 0] }
+  }
+set Hours   [StripLeadingZeros $Hours]
+set Minutes [StripLeadingZeros $Minutes]
+set Seconds [StripLeadingZeros $Seconds]
+return [expr {$Hours * 3600 + $Minutes * 60 + $Seconds}]
+}
+
+proc SecToTime {Seconds} {
+# Convert seconds into a time string in hh:mm:ss form, with leading 0's changed to spaces.
+set InSeconds $Seconds
+set Hours [expr {int ([expr {$Seconds / 3600}])}]
+set Seconds [expr {$Seconds - $Hours * 3600}]
+set Minutes [expr {int([expr {$Seconds / 60}])}]
+set Seconds [expr {$Seconds - $Minutes * 60}]
+set Output [format "%02u:%02u:%02u" $Hours $Minutes $Seconds]
+#puts "SecToTime: $InSeconds -> $Hours $Minutes $Seconds -> $Output"
+# Now just strip off the leading 0's (and unneeded ":"'s)
+# Search for the first character not a space, 0, or :
+# then change every character before that one to a space.
+set Output [StripLeadingZeros $Output]
+return $Output
+}
+
+proc TimeSubtract {Time1 Time2} {
+# Give the result of Time1 - Time2 in hh:mm:ss form.
+#puts "Subtracting: $Time1 - $Time2"
+if {$Time1 == "" || $Time2 == ""} return ""
+set Seconds1 [TimeToSec $Time1]
+set Seconds2 [TimeToSec $Time2]
+set Diff [expr {$Seconds1 - $Seconds2}]
+return [SecToTime $Diff]
+# If we wanted, we could write the ugly:
+# return [SecToTime [expr {[TimeToSec $Time1] - [TimeToSec  $Time2]}]]
+}
+
+proc TimeAdd {Time1 Time2} {
+# Give the result of Time1 + Time2 in hh:mm:ss form.
+# (I don't think we need this function; all time match in this program is subtraction.
+# However, I wrote the routine for something else, and include it here in case it becomes 
+# useful in the future.)
+# (Postscript: It turns out we did need the function after all.)
+if {$Time1 == "" || $Time2 == ""} return ""
+set Seconds1 [TimeToSec $Time1]
+set Seconds2 [TimeToSec $Time2]
+set Sum [expr {$Seconds1 + $Seconds2}]
+return [SecToTime $Sum]
+}
+
+proc TimeCompare {Time1 Time2} {
+# Compare Time1 and Time2, return -1:Time1 smaller, 0:Same, or 1:Time2 smaller
+set Seconds1 [TimeToSec $Time1]
+set Seconds2 [TimeToSec $Time2]
+if {$Seconds1 == $Seconds2} { return 0 }
+if {$Seconds1 < $Seconds2 } {
+  return -1
+  } else {
+  return 1
+  }
+  
+}
+
+#------------------------------------------------------------------------------------------------------
+# Read Number to Name Database
+#
+
+# There will likely be multiple files containing information to attach names
+# to SI Card numbers. One would be located one level up from the working directory,
+# and would contain those names which will be permenantly associated with a
+# given SI Card (i.e. for someone who owns an old card which does not store 
+# names internally).  Another file would be in the working directory, and would
+# contain temporary name associations, for example for rented sticks.
+# Each file should have one line per entry, with the stick number followed by 
+# one space followed by the full name.  
+# DO NOT INCLUDE ANY SPACES PRIOR TO THE SI CARD NUMBER.
+# DO NOT INCLUDE ANY BLANK LINES.
+# Each line should start with a card number and end with a name.
+# No attempt will be made to separate first from last names. 
+# 
+# If multiple entries exist for a given SI Card number, the last entered name will
+# be used, i.e. the day-of-event file will be used over the global file, and 
+# names entered later in the file will be used over those entered earlier in the file.
+# BUG NOTE: This causes a problem in the case of multiple people using the same
+# SI-Card on the same day; this can happen easily if sticks are rented, an early runner returns 
+# leaving their stick to be rented out a second time that day.
+#
+# Note that it is possible to use multiple number to name lookup files.
+# Reading in one does not clear the effects of reading a previous one.
+#
+
+proc ReadNumToName { {fname "DefaultFileRequestor"} } {
+global NameLookup
+
+# If no arguments, give file requestor; allow file selection
+#   else, pass through with file taken from argument
+
+if {$fname eq "DefaultFileRequestor"} {
+# If we get here, ReadNumToName was either called with no arguments,
+# or with our strange default value. Throw up a file requestor for 
+# the user to select the file from.
+  set numtonamefilename [tk_getOpenFile]
+  } else {
+# We were handed a filename. Do what we can with it.
+  set numtonamefilename $fname
+  }
+
+# Check whether file exists and looks valid
+# Read num to name file
+if [catch {open $numtonamefilename r} numtonamefilehandle] {
+  puts stderr "File opening error."
+  ErrorMsg "File opening error."
+  } else {
+  foreach line [split [read -nonewline $numtonamefilehandle] \n] {
+    set worklinelist [split $line]	;# Splits on whitespace: <space>, <tab>, <nl> (should be no nl)
+    set name [join [lrange $worklinelist 1 end]]
+    if {[info exists NameLookup([lindex $worklinelist 0])]} {
+      # This SI number already has a name associated with it, which we are 
+      # about to overwrite with the more recent name. Give a warning message.
+      ErrorMsg "Warning: Changing name for #[lindex $worklinelist 0]: $NameLookup([lindex $worklinelist 0]) -> $name"
+      }
+    set NameLookup([lindex $worklinelist 0]) $name
+    }
+  close $numtonamefilehandle
+  }
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# Set Working Directory
+#
+
+proc SetWorkingDirectory { {dirname "DefaultDirRequestor"} } {
+global rawdatafilename workingdir coursefilename 
+global DefaultRawFilename 
+global DefaultCourseFilename DefaultCourseFilenames 
+global DefaultNumToNameFilename DefaultNumToNameFilenames
+global DefaultGlobalNumToNameFNs
+# Call with either zero or one arguments; if none, then give a file requestor
+# to select the working directory; if one, then use that directory if possible.
+# Then, check the selected working directory to see if it contains likely
+# default files to use for course descriptions or the raw results file
+# (only use these defaults if we have no values for these filenames yet).
+
+# Give file requestor; allow directory selection
+
+if {$dirname eq "DefaultDirRequestor"} {
+# If we get here, SetWorkingDirectory likely called with no args.
+# Give a file requestor to let the user select something
+  set workingdir [tk_chooseDirectory]
+  } else {
+# SetWorkingDirectory called with an arg. 
+# Use that as the working directory.
+  set workingdir $dirname
+  }
+
+# Check whether dir exists and appears valid (writable, etc)
+# TODO
+
+# Check for a default raw datafile
+#   ReadRawData with given default raw datafile
+if {$rawdatafilename eq ""} {
+  if {[file exists [file join $workingdir $DefaultRawFilename]]} {
+    ReadRawData [file join $workingdir $DefaultRawFilename]
+    }
+  }
+
+# Check for a default course description file
+#   ReadCourses with given course description file
+# Old version: 
+#if {$coursefilename eq ""} {
+#  if {[file exists [file join $workingdir $DefaultCourseFilename]]} {
+#    ReadCourses [file join $workingdir $DefaultCourseFilename]
+#    }
+#  }
+if {$coursefilename eq ""} {
+  foreach TryThisFilename $DefaultCourseFilenames {
+    if {[file exists [file join $workingdir $TryThisFilename]]} {
+      ReadCourses [file join $workingdir $TryThisFilename]
+      break
+      }
+    }
+  }
+
+
+# Check for a runners database (i.e. name to SI Card mapping)
+# First, read in the default global number to names database (i.e. one directory up)
+set parentdir [file dirname $workingdir]
+# Old version:
+#if {[file exists [file join $parentdir $DefaultNumToNameFilename]]} {
+#  ReadNumToName [file join $parentdir $DefaultNumToNameFilename]
+#  }
+#set SpecFilename $DefaultNumToNameFilename
+#append SpecFilename "Global"
+#if {[file exists [file join $parentdir $SpecFilename]]} {
+#  ReadNumToName [file join $parentdir $SpecFilename]
+#  }
+foreach TryThisFilename $DefaultGlobalNumToNameFNs {
+  if {[file exists [file join $parentdir $TryThisFilename]]} {
+    ReadNumToName [file join $parentdir $TryThisFilename]
+    }
+  }
+
+# Now, read in the local one (i.e. in the current working directory)
+# Old version: 
+#if {[file exists [file join $workingdir $DefaultNumToNameFilename]]} {
+#  ReadNumToName [file join $workingdir $DefaultNumToNameFilename]
+#  }
+#set SpecFilename $DefaultNumToNameFilename
+#append SpecFilename "Event"
+#if {[file exists [file join $parentdir $SpecFilename]]} {
+#  ReadNumToName [file join $parentdir $SpecFilename]
+#  }
+foreach TryThisFilename $DefaultNumToNameFilenames {
+  if {[file exists [file join $workingdir $TryThisFilename]]} {
+    ReadNumToName [file join $workingdir $TryThisFilename]
+    break
+    }
+  }
+
+
+# Try to process
+if {$dirname eq "DefaultDirRequestor"} {
+  # Only try to process in this case; otherwise, this proc was called from somewhere 
+  # which will call the processing itself.
+  TryToProcess
+  }
+
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# Read Raw Datafile
+#
+
+proc ReadRawData { {fname "DefaultFileRequestor"}} {
+global rawdatafilename workingdir rawlist
+global GTGRaw
+
+# If no arguments, give file requestor; allow file selection
+#   else, pass through with file taken from argument
+if {$fname eq "DefaultFileRequestor"} {
+# If we get here, ReadRawData likely called with no args.
+# Give a file requestor to select the file from.
+  set rawdatafilename [tk_getOpenFile]
+  } else {
+# Use the arg we were passed
+  set rawdatafilename $fname
+  }
+
+# Check whether file exists and looks valid
+# TODO
+
+# If working dir is not yet set, set to file's dir
+#if {$workingdir eq ""} {
+#  set workingdir [file dirname $rawdatafilename]
+#  }
+if {$workingdir eq ""} {
+  SetWorkingDirectory [file dirname $rawdatafilename]
+  }
+
+# Read file into an internal list
+if [catch {open $rawdatafilename r} rawfilehandle] {
+  puts stderr "File opening error."
+  ErrorMsg "File opening error."
+  } else {
+  # First, clear in case we already read another raw results file
+  set rawlist [list]
+  foreach line [split [read -nonewline $rawfilehandle] \n] {
+    lappend rawlist $line
+    }
+  close $rawfilehandle
+  set GTGRaw 1
+  }
+
+# Try to process
+if {$fname eq "DefaultFileRequestor"} {
+  # Only try to process in this case; otherwise, this proc was called from somewhere 
+  # which will call the processing itself.
+  TryToProcess
+  }
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# Read Course Descriptions
+#
+
+proc ReadCourses { {fname "DefaultFileRequestor"} } {
+global workingdir coursefilename
+global NumCourses CourseName CourseNames CourseControls CourseLength
+global GTGCourse
+
+# If no arguments, give file requestor; allow file selection
+#   else, pass through with file taken from argument
+
+if {$fname eq "DefaultFileRequestor"} {
+# If we get here, ReadCourses was either called with no arguments,
+# or with our strange default value. Throw up a file requestor for 
+# the user to select the file from.
+  set coursefilename [tk_getOpenFile]
+  } else {
+# We were handed a filename. Do what we can with it.
+  set coursefilename $fname
+  }
+
+# Check whether file exists and looks valid
+# Read course description file
+if [catch {open $coursefilename r} coursefilehandle] {
+  puts stderr "File opening error."
+  ErrorMsg "File opening error."
+  } else {
+  # First, clear in case we already read another course file
+  set NumCourses 0
+  set CourseName(-1) "Unknown"
+  set CourseNames {}
+  foreach line [split [read -nonewline $coursefilehandle] \n] {
+    # NumCourses is an index for now (is off by one at this point as actual NumCourses)
+    set worklinelist [split $line =]
+    if {[llength $worklinelist] == 3} {
+      set CourseName($NumCourses) [lindex $worklinelist 0]
+      lappend CourseNames $CourseName($NumCourses)
+      set CourseControls($NumCourses) [split [lindex $worklinelist 1] ,]
+      set CourseLength($NumCourses) [lindex $worklinelist 2]
+      incr NumCourses
+      } else {
+      ErrorMsg "Problem in course file: $line"
+      }
+    }
+  close $coursefilehandle
+  set GTGCourse 1
+  BuildCourseEditMenu $CourseNames
+  }
+
+# Try to use this file's dir as a working dir if we don't already have one
+if {$workingdir eq ""} {
+  SetWorkingDirectory [file dirname $coursefilename]
+  }
+
+# Try to process 
+if {$fname eq "DefaultFileRequestor"} {
+  # Only try to process in this case; otherwise, this proc was called from somewhere 
+  # which will call the processing itself.
+  TryToProcess
+  }
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# Try to process
+#
+
+proc TryToProcess {} {
+global GTGRaw GTGCourse
+# Check whether we have a raw datafile in memory
+# Check whether we have a course description in memory
+# (Don't worry about having a working directory; this is problem for output routine.)
+# If pass all checks, process entire raw file
+if {$GTGRaw && $GTGCourse} {
+  ProcessRaw
+  }
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# Process Raw
+# 
+
+proc ProcessRaw {} {
+global rawlist
+global db NumEntries CourseName NameLookup
+global GTGResults
+# global dbSICard dbName dbNumPunches dbRealPunches dbRealPunchTime dbUse
+# This routine processes the entire raw file.
+# The file is already read into memory, and sits in rawlist.
+# The raw data will be processed here into db()
+#
+#    We treat each line of the raw data file as a separate entry (each line in the raw data
+# file corresponds to a different download at the download box). There is no assuption that
+# a given name or SICardNumber will be unique (the same stick could be rented out multiple
+# times at an event to different people, or the same person could run more than one course 
+# in an event; each is a separate entry here).  
+#    In those cases in which someone accidentally downloaded more than once (and this happens frequently,
+# sometimes with multiple full downloads, sometimes with several partial downloads finished off with 
+# one good one), we mark the superfluous downloads as entries to not be used. The assumption is made
+# that if there are multiple download entries share the same clear time and clear box number, then
+# they are duplicate downloads, and an effort is made to only keep the "best" of the duplicates.
+
+# Start with clearing results (in case was processed before)
+array unset db
+ClearResultsAndRaw
+set NumEntries 0
+
+# Parse each item in internal raw file
+#   Attempt to apply previous edits to entry TODO
+#   Generate internal entry for item
+set index -1		;# Call the first line (i.e. header) "index 0"
+foreach line $rawlist {
+  incr index
+  if {$index == 0} {
+    # Check that this looks like the header for a real Raw Data file
+    # Will start with: No.read at,SI-Card,St no,cat.,First name,name
+    # TODO
+    } else {
+    # Process the entry
+    # Check whether this line looks like a partial read 
+    #   (i.e. matches the first part of another line)
+    # Match everything up until ",,,,,,,,<end>"
+# The following works, but may not be the best approach.
+#    regexp {^(.*?)[,]*$} $line match sub1
+#ErrorMsg "Match: $match"
+#ErrorMsg "Sub1:  $sub1"
+#   Instead, continue with the read. 
+# See if that matches the first <length> of any line from this point on (or in entire file?)
+# If the length of the other is more than the full line length of this one, then set Use to 0
+    # Sanitize the line
+    #   Check for even number of " and matching {}, or just strip all three characters TODO
+    #   Check for appropriate number of , (use count from header) TODO
+    # Split into parts
+    set splitlinelist [split $line ,]
+    incr NumEntries
+    set db(Use,$index) 1	;# Set to 0 to skip/delete this entry
+    set db(Dup,$index) 0
+    set db(SICard,$index) [lindex $splitlinelist 2]
+#puts "SI: $db(SICard,$index)"
+    set db(Name,$index) "[lindex $splitlinelist 5] [lindex $splitlinelist 6]"
+    # Check if we have a number-to-name listing for this card number:
+    if {[info exists NameLookup($db(SICard,$index))]} {
+      # As this is written, we do a replacement of the name if we had this card number
+      # in any num to name database we read in, even if the name stored on the stick was
+      # a good one.  Might want to change this at some time.
+      # pseudocode: if db(Name,$index) != "" && !contains "RENTAL", then warning: changing name from on stick: db() -> NameLookup()
+      set db(Name,$index) $NameLookup($db(SICard,$index))
+      }
+#puts "($index) $db(SICard,$index) $db(Name,$index)"
+    # Here are the fields from the original raw data file.
+    # (Start numbering at 0)
+    # 2:SICard Number 5:First name 6:Last name
+    # 16:CLR_CN,day,time 19:CHKnum,day,time 22:STnum,day,time 25:FInum,day,time 
+    # 28:numpunches
+    # 29:1,, 32:2,, ... will continue to the max punches in this download set
+    set db(ClearCN,$index)   [lindex $splitlinelist 16]
+    set db(ClearTime,$index) [lindex $splitlinelist 18]
+    set db(StartTime,$index) [lindex $splitlinelist 24]
+    set db(FinishTime,$index) [lindex $splitlinelist 27]
+    set db(NumPunches,$index) [lindex $splitlinelist 28]
+    set punchlist ""
+    # Now, make the list of all punches recorded on the SI Card for this download
+    set db(RealPunches,$index) {}
+    set db(RealPunchTime,$index) {}
+    for {set i 0} {$i < $db(NumPunches,$index)} {incr i} {
+       set punchlist [format "%s %s" $punchlist [lindex $splitlinelist [expr {29 + 3*$i}]]]
+       lappend db(RealPunches,$index) [lindex $splitlinelist [expr {29 + 3*$i}]]
+       # The day would be ...30 + ... May want to check whether any days seem different. TODO
+       lappend db(RealPunchTime,$index) [lindex $splitlinelist [expr {31 + 3*$i}]]
+       }
+    # Do sanity checking on time values. Correct what is possible (12->24hr, etc).
+    DoTimeSanityCheck $index
+    if {$db(Use,$index)} {
+      # Now it should be safer to do time calculation
+      if {$db(FinishTime,$index) != ""} {
+        set db(TotalTime,$index) [TimeSubtract $db(FinishTime,$index) $db(StartTime,$index)]
+        } else {
+        set db(TotalTime,$index) "No Finish"
+        }
+      # Make the best guess as to the course this entry was running. 
+      GuessCourse $index
+      # GuessCourse sets db(,$index) for Course, Finished, NumCPunches, CPunches and CPunchTime
+      # Now, set a few strings for output to the raw results list.
+      if { $db(Course,$index) == -1} {
+        set Course "Unknown"
+        } else {
+        set Course $CourseName($db(Course,$index))
+        }
+      if { $db(Finished,$index) } {
+        set FinishedString "+"
+        } else {
+        set FinishedString "-"
+        }
+      set RawOutLine [format "%5s %-9s%-26s%-11s%s%s %s" \
+          [format "(%d)" $index] $db(SICard,$index) $db(Name,$index) $Course $FinishedString $db(TotalTime,$index) $punchlist]
+      LogRawResult $RawOutLine $index
+      } else {
+      # We appear to have had some problem with times which was unresolvable. Give a minimal raw output.
+      set db(Course,$index) -1
+      set db(Finished,$index) 0
+      set RawOutLine [format "%5s %-9s%-26s                      %s" \
+          [format "(%d)" $index] $db(SICard,$index) $db(Name,$index) $punchlist]
+      LogRawResult $RawOutLine $index
+      }
+    # Now that this entry is in the raw output, do the check for multiple downloads
+    CheckAndClearMultipleDownloads $index
+    }
+  }
+
+# db(Use,$i)		Boolean. 0: Skip/delete this entry.  1: Normal, this is an active entry
+# db(Dup,$i)		Boolean. 0: Normal entry. 1: This was set to not use because it is a duplicate
+# db(SICard,$i)		SI Card number 
+# db(Name,$i)		Runner's name
+# db(NumPunches,$i)	Number of real punches registered for this downloaded run
+# db(RealPunches,$i)	List, all control code numbers, in order punched, regardless of course relevance
+# db(RealPunchTime,$i)	List, time of each punch in RealPunches list
+# db(ClearTime,$i)	Time the card was cleared. Used for cleansing duplicate downloads from results.
+# db(ClearCN,$i)	Control number of box used to clear. Used to rule out simul clears from diff boxes.
+# db(StartTime,$i)	Start time, hh:mm:ss form
+# db(FinishTime,$i)	Finish time, hh:mm:ss form
+# db(TotalTime,$i)	FinishTime - StartTime, in hh:mm:ss format, regardless of course finish, etc
+# db(Course,$i)		Index of course assigned to this entry. May be a guess or imposed by user input
+# db(Finished,$i)	Boolean. Did this entry finish the course as set in db(Course,$i)
+# db(NumCPunches,$i)	Number of valid controls punched on the course assigned this entry
+# db(CPunches,$i)	List, control code numbers of punched controls on the course assigned this entry
+# db(CPunchTime,$i)	List, time of each punch in CPunches list
+#			The CPunches list will be basically a cleaned up version of the RealPunches list.
+#			i.e. CPunches will not contain punches not on the course, or punches after 
+#			any skipped control.
+# db(ElapsedTime,$i)	List, elapsed time to each punch in CPunches list, plus finish
+# db(SplitTime,$i)	List, split times for each punch in CPunches list, plus finish
+# db(DelayedWarnings,)	List, any warnings to go to the error log only after duplicates have been cleared. 
+
+OutputDelayedWarnings
+
+# The input file has been read.  Now calculate results for the first time to give the 
+# user the first approximation of the results (will later calculate results again after every edit).
+set GTGResults 1
+CalcResults
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# Output Raw Results
+#
+
+proc OutputRawResults {} {
+global rawlist
+# Simplistic proc: Just turn raw data into output data
+
+# First, clear the old
+ClearResultsAndRaw
+# Now, just move the raw data over
+foreach line $rawlist {
+  LogResult $line
+  }
+}
+
+#------------------------------------------------------------------------------------------------------
+# Set punch strings, etc
+#
+
+proc SetCoursePunchMisc {index Course Finished NumPunched GoodPunches GoodPunchTime} {
+global db
+# Since both FindCorrectPunches and GuessCourse need to set similar variables, do both here.
+# We can also calculate the elapsed and split time strings here.
+#
+# First, the easy ones:
+set db(Course,$index)      $Course
+set db(Finished,$index)    $Finished	;# ... but see below; might still not have punched "Finish"
+set db(NumCPunches,$index) $NumPunched
+set db(CPunches,$index)    $GoodPunches
+set db(CPunchTime,$index)  $GoodPunchTime
+# Now, start working out the misc elapsed and split time lists
+set db(ElapsedTime,$index) {}
+set db(SplitTime,$index) {}
+set LastPunchTime $db(StartTime,$index)
+foreach PunchTime $db(CPunchTime,$index) {
+  # Might want to save some trouble be saving these now in ShortTime form.  TODO
+  lappend db(ElapsedTime,$index) [TimeSubtract $PunchTime $db(StartTime,$index)]
+  lappend db(SplitTime,$index) [TimeSubtract $PunchTime $LastPunchTime]
+  set LastPunchTime $PunchTime
+  }
+if {$db(FinishTime,$index) eq ""} {
+  # Looks like they didn't punch finish, even though all other controls might be punched.
+  # There is a possibility of implementing mercy elsewhere (around CalcResults, likely),
+  # since the person clearly found download and thus the failed finish punch was a fluke. TODO
+  # However, for now, we set Finished to false.
+  set db(Finished,$index) 0
+  }
+if {$db(Finished,$index)} {
+  # Work out the final split/elapsed for the leg to the finish
+  lappend db(ElapsedTime,$index) [TimeSubtract $db(FinishTime,$index) $db(StartTime,$index)]
+  lappend db(SplitTime,$index) [TimeSubtract $db(FinishTime,$index) $LastPunchTime]
+  }
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# Find correct punches
+#
+
+proc FindCorrectPunches {index {course -1} } {
+global db NumCourses CourseName CourseControls
+# For the given entry, and the given course (or for the 
+# course assigned to that entry if no second argument),
+# and the list of real punches stored for that entry, determine
+# the list of correct punches, punch times, and various split 
+# times for that course.
+# Will either:
+# If course -1 (i.e. default 2nd arg): Store these results in the appropriate db location.
+#    or 
+# If handed course:  Return these values in a big return list.
+
+if {$course == -1} {
+  # Looks like a default course. Use what is stored for this entry in db.
+  set CourseIndex $db(Course,$index)
+  } else {
+  set CourseIndex $course
+  }
+
+set NumPunched 0	;# Number of good punches on course being checked
+set PunchIndex 0	;# Index into list of all punches by this runner, points last Official Punch so far
+set GoodPunches {}	;# List of all valid punches on course being checked. 
+set GoodPunchTime {}	;# (This will be what we use for calculating splits from, eventually.)
+set NumToPunch [llength $CourseControls($CourseIndex)]
+foreach Control $CourseControls($CourseIndex) {
+  # Once skipped controls are coded for, this will be where the skip occurs
+  # Now, checking from the point of the last good punch, look for the next needed punch on this course
+  if { [set NewPunch [lsearch -start $PunchIndex $db(RealPunches,$index) $Control]] != -1} {
+    # Good punch; continue
+    # Will eventually need to change the following if controls are skippable
+    set PunchIndex $NewPunch
+    lappend GoodPunches $Control
+    lappend GoodPunchTime [lindex $db(RealPunchTime,$index) $PunchIndex]
+    incr NumPunched
+    if {$NumPunched == $NumToPunch} {
+      # Looks like they finished this course. Can wrap things up now
+      set Finished 1
+      }
+    } else {
+    # Missed a punch; didn't finish this course
+    set Finished 0
+    break
+    } ;# if punch matches
+  } ;# foreach control on course(courseindex)
+
+if {$course == -1} {
+  # Again, a default course. We want to change the locations in db.
+  SetCoursePunchMisc $index $CourseIndex $Finished $NumPunched $GoodPunches $GoodPunchTime
+  } else {
+  # We are calling from GuessCourse. Return the results in a monster return list.
+  return [list $Finished $NumPunched $GoodPunches $GoodPunchTime]
+  }
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# GuessCourse
+#
+
+proc GuessCourse {index} {
+global db NumCourses CourseName CourseControls
+# (Used to) Return a list: {BestGuessOfCourseIndex FinishedBoolean NumPunchedOnThisCourse PunchList PunchTimeList}
+# Now: Just sets the values itself.
+
+set Finished 0			;# Boolean
+set BestGuessCourse -1		;# Will still be -1 at end if didn't punch any controls
+set NumPunchedOnBestMatchCourse 0 ;# Num punched on the best match of course
+
+set OfficialPunches {}		;# List of all valid punches on best match of course
+set OfficialPunchTime {}	;# Time associated with given punch
+
+# Want to check that index is in use, and that some courses have been read
+# TODO
+
+# Loop over courses in reverse
+for {set CourseIndex [expr {$NumCourses - 1}]} {$CourseIndex >= 0} {incr CourseIndex -1} {
+  set cplist [FindCorrectPunches $index $CourseIndex]
+  set Finished      [lindex $cplist 0]
+  set NumPunched    [lindex $cplist 1]  ;# Number of good punches on course being checked
+  set GoodPunches   [lindex $cplist 2]	;# List of all valid punches on course being checked
+  set GoodPunchTime [lindex $cplist 3]	;# List of times associated with GoodPunches
+  set NumToPunch [llength $CourseControls($CourseIndex)]
+  if {$Finished} {
+    set BestGuessCourse $CourseIndex
+    set NumPunchedOnBestMatchCourse $NumPunched
+    set OfficialPunches $GoodPunches
+    set OfficialPunchTime $GoodPunchTime
+    break
+    } else {
+    # Apparently missed a punch.  
+    # Have they punched the most controls on this course, as compared to other courses?
+    if {$NumPunched > $NumPunchedOnBestMatchCourse} {
+      # ... then this is our best guess (so far) for the course this runner was intending to run
+      set BestGuessCourse $CourseIndex
+      set NumPunchedOnBestMatchCourse $NumPunched
+      set OfficialPunches $GoodPunches
+      set OfficialPunchTime $GoodPunchTime
+      }
+    }
+  }
+
+# Old version returned the relevant values in a list
+#return [list $BestGuessCourse $Finished $NumPunchedOnBestMatchCourse $OfficialPunches $OfficialPunchTime]
+# New version calls another function which sets these values in db
+SetCoursePunchMisc $index $BestGuessCourse $Finished $NumPunchedOnBestMatchCourse $OfficialPunches $OfficialPunchTime
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# Check and Clear Multiple Downloads
+#
+
+proc CheckAndClearMultipleDownloads {index} {
+global db NumEntries rawlist
+# Do this by checking for duplicate clear times; in such cases, keep the line with 
+# the greatest length (i.e. most information). 
+# Note that it is possible to imagine pathological cases in which neither download 
+# is complete, which would not be handled well here.
+#
+# Note that we could possibly improve this routine slightly by also checking that the SICard 
+# number matches. At the moment, I cannot imagine a circumstance in which there are multiple
+# clears at the same time and at the same box.
+
+if {![info exists db(ClearTime,$index)] || ![info exists db(ClearCN,$index)]} {
+  # Some problem with our own cleartime/cn. Just exit.
+  return
+  }
+if {$db(ClearTime,$index) == ""} {
+  # Did not clear.  No good way to check this here, so just exit.
+  return
+  }
+
+set TurnOffIndex 0	;# This will be an index to be cleared as a partial download.
+# Loop over all entries (really only those raw processed until this point in time)
+for {set i 1} {$i < $NumEntries} {incr i} {
+  if {$i == $index} {
+    # We are looking at our own entry here.  
+    # (Best to go thorugh all entries rather than to NumEntries-1, in case this 
+    # gets called from a time other than during the first processing of raw input).
+    continue
+    }
+#if {![info exists db(ClearTime,$i)]}     { puts "ClearTime i:$i" }
+#if {![info exists db(ClearTime,$index)]} { puts "ClearTime index:$index" } 
+#if {![info exists db(ClearCN,$i)]}       { puts "ClearCN   i:$i" }
+#if {![info exists db(ClearCN,$index)]}   { puts "ClearCN   index:$index" }
+#
+  if {![info exists db(ClearTime,$i)] || ![info exists db(ClearTime,$index)] || \
+      ![info exists db(ClearCN,$i)]   || ![info exists db(ClearCN,$index)]} {
+    # Can't compare, so just move on
+    continue
+    }
+  if {$db(ClearTime,$i) == $db(ClearTime,$index) && $db(ClearCN,$i) == $db(ClearCN,$index)} {
+    # Same clear times from the same box. This has to be a duplicate download.
+    set ilen     [string length [lindex rawlist $i]]
+    set indexlen [string length [lindex rawlist $index]]
+    if {$ilen < $indexlen} {
+        set TurnOffIndex $i
+      } elseif {$indexlen < $ilen} {
+        set TurnOffIndex $index
+      } else {
+        # Both same size.  Set earlier read to not use. 
+        if {$i < $index} {
+          set TurnOffIndex $i
+          } else {
+          set TurnOffIndex $index
+          } ;# if i < index
+      } ;# if ilen < indexlen
+    if {$TurnOffIndex != 0} {
+      if {$db(Use,$TurnOffIndex) != 0} {
+        # (If it had been zero, no need to turn it off again.)
+        set db(Use,$TurnOffIndex) 0
+        set db(Dup,$TurnOffIndex) 1
+        ErrorMsg "Dup Cleared($TurnOffIndex): [lindex $rawlist $TurnOffIndex]"
+        } ;# if not already turned off
+      set TurnOffIndex 0	;# Reset it
+      } ;# if TurnOffIndex != 0
+    } ;# if (time and cn the same)
+  } ;# for (over NumEntries)
+}
+
+#------------------------------------------------------------------------------------------------------
+# Sanity Checking
+#
+
+proc DoTimeSanityCheck {index} {
+global db
+# We assume that all possible has been processed from the raw datafile into the following:
+#   db(StartTime,$index)	Start time
+#   db(RealPunchTime,$index)	List of actual punch times
+#   db(FinishTime,$index)	Finish time
+# (If we wanted, we could also check clear time, but old cards don't store this, and I cannot
+# think of a reason yet to care about whether the clear is "good". TODO?)
+# Check that time proceeds in a monotonically increasing manner
+# i.e. Start time < 1st punch time < 2nd punch time < ... < Last punch time < Finish time
+# If not, do what is possible to fix:
+#   The most common problem is likely to be with old SI cards which store 12 hour time, when 
+#   someone's times go from 11:xx to 00:xx.
+#   Recognise by travel backward in time by > 6 hours
+#   Solve by adding 12 hours to any such 6+ hour step backward in time. 
+#
+# If we see a problem with times, want to give a warning message.  However, we do not want to
+# give warnings when this is a duplicate entry. As a result, we will save any possible warning
+# messages, and then print out the stored warnings only for those entries which are not duplicates,
+# i.e. db(Dup,$i) != 1, after processing the entire raw file.
+#
+if {![info exists db(StartTime,$index)] || ![info exists db(RealPunchTime,$index)] || ![info exists db(FinishTime,$index)]} {
+  # Something hasn't been set in db yet.  Give warning, set to not use, and return.
+  DelayedErrorMsg $index "Problem with time in $index. Removing entry. Look carefully at this entry."
+  # That isn't a terribly informative error message. However, if we get that error message, something
+  # has gone very wrong and someone needs to look closely at this anyway.
+  set db(Use,$index) 0
+  return
+  }
+if { $db(StartTime,$index) eq ".929" || $db(StartTime,$index) eq "" } {
+  # No start on this entry.  For now skip it. May want to do something better with these. TODO
+  DelayedErrorMsg $index "Skipping ($index) $db(SICard,$index) $db(Name,$index) (No start.)"
+  set db(Use,$index) 0
+  return
+  }
+# Check that time moves consistently forward, i.e. each successive time point is later than the one before.
+# (If not, we have some problem, such as a 12 hour time rollover, a DST bug, a mis-set clock, etc.)
+set TwelveHrWarning 0			;# Will toggle to 1 if we need to put a warning about 12->24hr conversion
+set TimeMark $db(StartTime,$index)	;# This time point will move forward, from start, through punches, to finish
+if {$db(RealPunchTime,$index) != {} && [lindex $db(RealPunchTime,$index) end] != {}} {
+  # We have number of punches greater than 0, and all punch times (actually just last one) were read. 
+  foreach PunchTime $db(RealPunchTime,$index) {
+    # Check that this new time is later than the previous mark
+    if {[TimeCompare $TimeMark $PunchTime] == 1} {
+      # Looks like a supposedly later punch occurred "earlier in time". Likely a clock problem of some sort.
+      if {[TimeCompare $TimeMark [TimeAdd $PunchTime  "6:00:00"]] == 1 && \
+          [TimeCompare $TimeMark [TimeAdd $PunchTime "12:00:00"]] != 1} {
+        # This means that the mark (previous time) is more than 6 hours ahead of the punch (new time), but <= 12 hours ahead.
+        # Likely to be a 12hr rollover. Add 12 hours to the result. 
+        # The next command replaces the value at the first location in the list matching $PunchTime, with "$PunchTime + 12"
+        lset db(RealPunchTime,$index) [lsearch $db(RealPunchTime,$index) $PunchTime] [TimeAdd $PunchTime "12:00:00"]
+        set TwelveHrWarning 1
+        set PunchTime [TimeAdd $PunchTime "12:00:00"]
+        } else {
+        # Likely some clock problem, but the sort is difficult to determine. 
+        # Give a warning, and set it to not use.
+        DelayedErrorMsg $index "Clock Problem at a control. ($index) $db(SICard,$index) $db(Name,$index). $TimeMark > $PunchTime Skipping entry."
+        set db(Use,$index) 0
+        return
+        }
+      }
+    # Now move the mark forward
+    set TimeMark $PunchTime
+    }
+  } ;# if (have some punch times)
+if {$db(FinishTime,$index) != ""} {
+  # We have a finish punch.
+  # Check that the finish time is later than the previous mark
+  if {[TimeCompare $TimeMark $db(FinishTime,$index)] == 1} {
+    # Looks like the finish occurred "earlier in time" than the previous punch (last control, or start if no controls)
+    if {[TimeCompare $TimeMark [TimeAdd $db(FinishTime,$index)  "6:00:00"]] == 1 && \
+        [TimeCompare $TimeMark [TimeAdd $db(FinishTime,$index) "12:00:00"]] != 1} {
+      # This means that the mark (previous time) is more than 6 hours ahead of the finish (new time), but <= 12 hours ahead.
+      # Likely to be a 12hr rollover. Add 12 hours to the finish. 
+      set db(FinishTime,$index) [TimeAdd $db(FinishTime,$index) "12:00:00"]
+      set TwelveHrWarning 1
+      } else {
+      # Likely some clock problem, but the sort is difficult to determine.
+      # Give a warning, and set to not use this entry.
+      DelayedErrorMsg $index "Clock Problem at finish. ($index) $db(SICard,$index) $db(Name,$index). Skipping entry."
+      set db(Use,$index) 0
+      return
+      }
+    }
+  # Would move the mark forward here, if there were anything else to do with it.
+  } ;# if (have a finish time)
+if {$TwelveHrWarning} {
+  DelayedErrorMsg $index "12hr -> 24hr conversion applied to ($index) $db(SICard,$index) $db(Name,$index)."
+  }
+}
+
+#------------------------------------------------------------------------------------------------------
+# Compare results
+#
+
+proc CompareResults {r1 r2} {
+global db 
+# Compares two runners, presumed to be on the same course. r1 and r2 are entry indexes
+# Return -1 if r1 is above r2 in results, 1 if r2 is above r1, and 0 if they tied.
+# Finishers always ranked above DNF
+# Finishers ranked by time
+# DNFs ranked first by number of good controls punched, then by time
+#
+if {![info exists db(Use,$r1)] || ![info exists db(Use,$r2)]} {
+  puts stderr "Comparing results index, at least one of which does not exist: $r1 $r2"
+  return 0
+  }
+if {$db(Finished,$r1) && !$db(Finished,$r2)} { return "-1" }
+if {$db(Finished,$r2) && !$db(Finished,$r1)} { return  "1" }
+if {$db(Finished,$r1) &&  $db(Finished,$r2)} {
+  # Both finished
+  return [TimeCompare $db(TotalTime,$r1) $db(TotalTime,$r2)]
+  } else {
+  # Both DNFed
+  if {$db(NumCPunches,$r1) == $db(NumCPunches,$r2)} {
+    # Same number of valid punches. Eventually sort by time to last good punch
+    return "0"	;# TODO
+    }
+  if {$db(NumCPunches,$r1) > $db(NumCPunches,$r2)} {
+    return "-1"
+    } else {
+    return "1"
+    }
+  }
+}
+
+#------------------------------------------------------------------------------------------------------
+# Calc Results
+#
+
+proc CalcResults {} {
+global db NumEntries
+global NumCourses CourseName CourseControls CourseLength
+global EditIdx rbox		;# We need these to reset the editing selections after a re-calc
+global OutputRealPunches OutputHTML HideErrors
+global HTMLTitle
+global GTGResults
+# This routine will calculate the final results (runner ranking for each course, detailed split 
+# comparisons, etc) and display them.  
+# It will also display a raw output for use in debugging, which will be easily removed for final web publishing.
+# This routine will need to be re-called any time any significant change has been made in editing 
+# any record (e.g. runner's course changed, control skip added, etc). 
+#
+# Note: We will get into trouble in this output when the number of finishers on a course exceeds 99;
+# will have to redo the formats to leave room for the extra digit in that case.
+# I choose to leave it this way, for now, to conserve the extra screen space (which already scrolls
+# over a wide horizontal range for the advanced splits). 
+
+# There are a few routines which blindly call this routine to update the output section.
+# Just check this variable to see whether we have anything yet to output.
+if {$GTGResults == 0} {return}
+
+# First, clear the previous output ...
+# Note that we will ignore the HideErrors variable if outputting html, and always act as though it were true.
+# (I doubt anyone will ever want to see the raw output in the final web results.)
+if {$OutputHTML || $HideErrors} {
+  # ... completely. 
+  ClearResults
+  } else {
+  # ... and start with just the raw output
+  ClearResultsToRaw
+  }
+
+# Output the html header code if necessary
+if {$OutputHTML} {
+  LogResult "<html>"
+  LogResult "<head>"
+  LogResult "<title>$HTMLTitle</title>"
+  LogResult "</head>"
+  LogResult ""
+  LogResult "<body>"
+  LogResult ""
+  LogResult "<h1 align=\"center\">$HTMLTitle</h1>"
+  LogResult ""
+  LogResult ""
+  LogResult "<pre>"
+  }
+
+# Build up various lists which sort into result order.  Here are what the various lists are:
+#
+# FinishOrder($courseidx)		An index listing of all runners on the given course, sorted into finish order
+# ElapsedTimes($courseidx,$legnum)	A listing of the times various people had for the elapsed time to a given leg
+# SplitTimes($courseidx,$legnum)	A listing of the times various people had for the split time for a given leg
+#					Note: legnum 0 is the first leg. There is also a leg from last control to finish here.
+# 
+# Note that these Elapsed/SplitTimes lists are a little odd. They are only the times; there is no record kept
+# of who the time belongs to. 
+# However, we do not need that information; all that is important is where each time falls in the results, 
+# e.g. time 3:45 is the third one in the list.  Later, when we need to find out what place a particular runner 
+# is in, we search the list for the first occurrance of their time, e.g. if George had a time of 3:45, we do a 
+# search, find that time as the third element in the list, and know that he is in third place. (Remember that Tcl
+# numbers elements from 0, so 3:45 will show up with an index of 2 if it is the 3rd element in the list.)
+#
+
+# Clear the sorted results lists
+for {set CourseIndex -1} {$CourseIndex < $NumCourses} {incr CourseIndex} {
+  set FinishOrder($CourseIndex) {}	;# Index of runners on this course, sorted by final place
+  # Loop through the legs on this course (remembering to include the finish leg)
+  if {$CourseIndex != -1} {
+    for {set legnum 0} {$legnum <= [llength $CourseControls($CourseIndex)]} {incr legnum} {
+      set ElapsedTimes($CourseIndex,$legnum) {}
+      set SplitTimes($CourseIndex,$legnum)   {}
+      }
+    }
+  }
+# Loop through all entries, adding each used index into the correct course results list (not yet sorted)
+for {set index 1} {$index <= $NumEntries} {incr index} {
+  if {[info exists db(Use,$index)]} {
+    if {$db(Use,$index)} {
+      lappend FinishOrder($db(Course,$index)) $index
+      }
+    }
+  }  
+# Now, go through each leg of each course, adding to the Elapsed and Split Times lists.
+for {set CourseIndex 0} {$CourseIndex < $NumCourses} {incr CourseIndex} {
+  foreach index $FinishOrder($CourseIndex) {
+    # We aren't going through in sorted order yet (sort happens below), but we don't care at this point
+    set legnum 0
+    foreach ElapsedTime $db(ElapsedTime,$index) SplitTime $db(SplitTime,$index) {
+      # Note that there should be equal numbers of both elapsed and split times (for a given entry),
+      # so one list won't run out before the other above
+      lappend ElapsedTimes($CourseIndex,$legnum) $ElapsedTime
+      lappend SplitTimes($CourseIndex,$legnum)   $SplitTime
+      incr legnum
+      } ;# foreach Elap and Split
+    } ;# foreach index on course
+  } ;# for (loop by course)
+# Now, sort the lists. Note that Course -1 (Unknown) is not sorted in any way.
+for {set CourseIndex 0} {$CourseIndex < $NumCourses} {incr CourseIndex} {
+  set FinishOrder($CourseIndex) [lsort -command CompareResults $FinishOrder($CourseIndex)]
+  # Loop through the legs on this course (remembering to include the finish leg)
+  for {set legnum 0} {$legnum <= [llength $CourseControls($CourseIndex)]} {incr legnum} {
+    set ElapsedTimes($CourseIndex,$legnum) [lsort -command TimeCompare $ElapsedTimes($CourseIndex,$legnum)]
+    set SplitTimes($CourseIndex,$legnum)   [lsort -command TimeCompare $SplitTimes($CourseIndex,$legnum)]
+    }
+  }
+
+LogResult ""
+LogResult "_________________________________________________________________________________"
+if {$OutputHTML} {
+  LogResult "<font size=\"4\"><b>Results</b></font>"
+  } else {
+  LogResult "Results"
+  }
+LogResult ""
+
+# Loop over all courses. Include "Unknown", for a place to put people who didn't punch very much
+for {set CourseIndex -1} {$CourseIndex < $NumCourses} {incr CourseIndex} {
+  if {$CourseIndex == "-1"} {
+    if {$FinishOrder($CourseIndex) != {}} {
+      LogResult ""
+      LogResult "Unknown Course. Cannot guess course for the following runners:"
+      } else {
+      # Don't output the "Unknown Course" heading if there are no unknowns.
+      continue
+      }
+    } else {
+    if {$OutputHTML} {
+      LogResult ""
+      LogResult [format "<b>%s Course: %d KP %s km </b>" \
+         $CourseName($CourseIndex) [llength $CourseControls($CourseIndex)] $CourseLength($CourseIndex)]
+      } else {
+      LogResult ""
+      LogResult [format "%s Course: %d KP %s km " \
+         $CourseName($CourseIndex) [llength $CourseControls($CourseIndex)] $CourseLength($CourseIndex)]
+      }
+    }
+  LogResult ""
+  # Now, print the entries (Place, name, and finish time) under this course
+  foreach index $FinishOrder($CourseIndex) {
+    if {$db(Finished,$index)} {
+      set PlaceNum [expr {[lsearch $ElapsedTimes($CourseIndex,[llength $CourseControls($CourseIndex)]) \
+         $db(TotalTime,$index)] + 1}]
+      set ResultString $db(TotalTime,$index)
+      if {$OutputRealPunches == 1} {
+        set RealPunchesString $db(RealPunches,$index)
+        } else {
+        set RealPunchesString ""
+        }
+      } else {
+      set PlaceNum ""
+      set ResultString "     DNF"
+      if {$OutputRealPunches == 1} {
+        set RealPunchesString $db(RealPunches,$index)
+        } else {
+        set RealPunchesString ""
+        }
+      }
+    LogResult [format " %2s %-26s  %s     %s" $PlaceNum $db(Name,$index) $ResultString $RealPunchesString] $index
+    }
+  } ;# for CourseIndex looping over all courses including Unknown
+
+LogResult ""
+LogResult "_________________________________________________________________________________"
+if {$OutputHTML} {
+  LogResult "<font size=\"4\"><b>Splits</b></font>"
+  } else {
+  LogResult "Splits"
+  }
+LogResult ""
+
+if {1} {
+# Loop over all courses a second time. Now outputting the detailed splits results. Skip "Unknown" this time.
+for {set CourseIndex 0} {$CourseIndex < $NumCourses} {incr CourseIndex} {
+  LogResult ""
+  if {$OutputHTML} {
+    LogResult [format "<b>%s Course: %d KP %s km </b>" \
+         $CourseName($CourseIndex) [llength $CourseControls($CourseIndex)] $CourseLength($CourseIndex)]
+    } else {
+    LogResult [format "%s Course: %d KP %s km " \
+         $CourseName($CourseIndex) [llength $CourseControls($CourseIndex)] $CourseLength($CourseIndex)]
+    }
+  LogResult ""
+  # Print header: Name Result Start 1.(CN1) 2.(CN2) ... N.(CNN) Finish
+  set HeaderStr "  # Name                         Result   Start   "
+  for {set i 0} {$i < [llength $CourseControls($CourseIndex)]} {incr i} {
+    append HeaderStr [format " %2s.(%3s) " [expr {$i + 1}] [lindex $CourseControls($CourseIndex) $i] ]
+    }
+  append HeaderStr "  Finish.           min/km"
+  LogResult $HeaderStr
+  # Now, print the entries, with detailed split information, under this course
+  foreach index $FinishOrder($CourseIndex) {
+    if {$db(Finished,$index)} {
+      set PlaceNum [expr {[lsearch $ElapsedTimes($CourseIndex,[llength $CourseControls($CourseIndex)]) \
+         $db(TotalTime,$index)] + 1}]
+      set ResultString $db(TotalTime,$index)
+      } else {
+      set PlaceNum ""
+      set ResultString "DNF"
+      }
+#    LogResult [format "    %-26s %8s %8s  %s" \
+#      $db(Name,$index) $ResultString $db(StartTime,$index) $db(CPunchTime,$index)] $index
+    # First, the elapsed line --------------------------
+    set OutStr [format " %2s %-26s %8s %8s " $PlaceNum $db(Name,$index) $ResultString $db(StartTime,$index)]
+    set legnum 0
+    foreach ElapTime $db(ElapsedTime,$index) {
+      set ElapPlace [expr {[lsearch $ElapsedTimes($CourseIndex,$legnum) $ElapTime] + 1}]
+      append OutStr [format "%7s%3s" [TimeToShortTime $ElapTime] $ElapPlace]
+      incr legnum
+      }
+    if {$db(Finished,$index)} {
+      append OutStr [format "%8s" $ElapTime]
+      }
+    # Work out min/km, if possible
+    set CLen $CourseLength($db(Course,$index))
+    if {$db(Finished,$index) && $CLen != "" && $CLen != 0} {
+      append OutStr [format "   %6.2f" [expr ([TimeToSec $db(TotalTime,$index)]/60.0) / $CLen]]
+      }
+    LogResult $OutStr $index
+    # Second, the splits line --------------------------
+    set OutStr [format "%49s" " "]	;# Just a convenient way to get a bunch of spaces
+    set legnum 0
+    foreach SplitTime $db(SplitTime,$index) {
+      set SplitPlace [expr {[lsearch $SplitTimes($CourseIndex,$legnum) $SplitTime] + 1}]
+      append OutStr [format "%7s%3s" [TimeToShortTime $SplitTime] $SplitPlace]
+      incr legnum
+      }
+    LogResult $OutStr $index
+    # Third, the split delta line ----------------------
+    set OutStr [format "%49s" " "]	;# Just a convenient way to get a bunch of spaces
+    set legnum 0
+    foreach SplitTime $db(SplitTime,$index) {
+      set SplitDelta [TimeSubtract $SplitTime [lindex $SplitTimes($CourseIndex,$legnum) 0]]
+      append OutStr [format "%7s%3s" [TimeToShortTime $SplitDelta] ""]
+      incr legnum
+      }
+    LogResult $OutStr $index
+    } ;# foreach index on the course
+  } ;# for CourseIndex looping over all courses (except Unknown)
+} ;# if {debug}
+
+if {$OutputHTML} {
+  LogResult ""
+  LogResult "</pre>"
+  LogResult "</body>"
+  LogResult "</html>"
+  }
+
+HighlightAllLinesForEntry $EditIdx $rbox
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# 
+#
+
+# Can ignore this section.  This is where I was originally working out how to do results, most of
+# which eventually got changed to something else (the "possibly easier" part in the middle, if you care).
+#
+#forget recalc above. instead:
+#
+#Variables:
+#ElapsedOrder(coursenum,legnum)	List of runnerindexes, in the order that they were at that elapsed time,
+#				i.e. as of control number legnum. Note for maxleg+1 this will be the
+#				final results ordering
+#SplitsOrder(coursenum,legnum)	List of runnerindexes, in order that they finished the given split
+#
+#ElapsedPlaces(coursenum,legnum)	List of place for runner by index into this and Elapsed/SplitOrder above
+#				e.g. if ElapsedOrder() list is {5 3 4 7} and ElapsedPlaces() is {1 2 2 4},
+#				then 5 was in first place, 3 and 4 tied for second, and 7 was in fourth. 
+#SplitsPlaces(coursenum,legnum)	
+#
+# Possibly easier: 
+# ElapsedTimes(coursenum,legnum) List of all elapsed times, sorted in order
+#				When used, just search for the first match to own elapsed time for place number.
+# SplitTimes(coursenum,legnum)
+#
+# If a runner leaves a course (i.e. course is changed), remove their elapsed and split times from the lists.
+# It doesn't matter if there is a tie; just remove one time that matches theirs, and leave the rest sorted.
+# If generating and sorting these lists at results calc time, don't even need to do that much.
+#
+#
+#Procedures:
+#CalcSplits	Given a runner with a course and the real punch times, determine elapsed and split times per leg
+#		Call CalcSplits after calling GuessCourse or SetCourse
+#		db(Elapsed,$index)	The elapsed list
+#		db(Splits,$index)	The splits list
+#CalcRealPunches	Arguments: runnerindex, course (can't use db(Course,index) if using from inside GuessCourse)
+#		Take code from GuessCourse, move to individual procedure
+#
+#Insert and Delete to ElapsedOrder and SplitsOrder lists
+#Only two functions, InsertOrderList and DeleteOrderList; will handle both Elapsed and Splits lists
+#Hand it a runnerindex, it will determine the relevant course from db(..,runnerindex), then
+#carry out the insertion or deletion
+#
+#for SetCourse, then:
+#proc SetCourse {runnerindex,coursenum}
+#See if course is already set
+#  If so, then DeleteOrderList runnerindex
+#set db(Course,runnerindex) coursenum
+#CalcRealPunches runnerindex
+#CalcSplits runnerindex
+#InsertOrderList runnerindex
+
+#------------------------------------------------------------------------------------------------------
+# ToggleHTML
+#
+
+proc ToggleHTML {} {
+global OutputHTML
+
+if {$OutputHTML} {
+  set OutputHTML 0
+  .buttonrow.html configure -text "Turn HTML On"
+  } else {
+  set OutputHTML 1
+  .buttonrow.html configure -text "Turn HTML Off"
+  }
+
+CalcResults
+
+}
+
+
+#------------------------------------------------------------------------------------------------------
+# Editing
+#
+
+proc ActivateSelectedLine {alist} {
+global db ridxref SelectedLine CourseName EditIdx
+global CurrentEditName
+set SelectedLine [$alist curselection]
+# puts "Activate: $SelectedLine"
+if {$SelectedLine eq ""} {
+  return
+  }
+if {$SelectedLine > [llength $ridxref]} {
+  # Clicked in window in region outside of data (i.e. past the end of the list). Just return.
+  return
+  }
+set EditIdx [lindex $ridxref $SelectedLine]
+if {$EditIdx != -1} {
+  set Name $db(Name,$EditIdx)
+  } else {
+  set Name "(blank line)"
+  }
+#puts "Selected line for $EditIdx $Name"
+set CurrentEditName $Name
+if {$EditIdx != -1} {
+  if {$db(Use,$EditIdx) != 0} {
+    # i.e. we are using this entry. Give a delete button
+    .editbox.remove configure -text "Delete"
+    } else {
+    # already not using this one. Give an un-delete button
+    .editbox.remove configure -text "Undelete"
+    }
+  .editbox.coursemenu configure -text $CourseName($db(Course,$EditIdx))
+  } else {
+  .editbox.coursemenu configure -text " "
+  .editbox.remove configure -text " "
+  }
+HighlightAllLinesForEntry $EditIdx $alist
+# As we leave here, the global EditIdx is remembered.
+# This is the index of the entry that we have currently selected (or -1, if a "blank line")
+}
+
+proc HighlightAllLinesForEntry {HighlightIdx alist} {
+global ridxref
+# Highlight all lines associated with the given line
+# (unless the given line is "blank", i.e. a header or such)
+$alist selection clear 0 end
+if {$HighlightIdx != -1} {
+  set i 0
+  foreach idx $ridxref {
+    if {$idx == $HighlightIdx} {
+      $alist selection set $i
+      }
+    incr i
+    }
+  }
+}
+
+proc HandleEditName {} {
+global db EditIdx CurrentEditName
+if {$EditIdx != -1} {
+  set oldname $db(Name,$EditIdx)
+  set db(Name,$EditIdx) $CurrentEditName
+  ErrorMsg "Changing name ($EditIdx) $db(SICard,$EditIdx) $oldname to $db(Name,$EditIdx)"
+  }
+CalcResults
+}
+
+proc BuildCourseEditMenu {courses} {
+global EditCourseMenu
+# Argument (courses) should be a list of course names, exactly as they appear in CourseNames
+#
+# First, clear the old menu
+$EditCourseMenu delete 0 end
+# Now, make a new menu entry for each element of $courses
+foreach course $courses {
+  set cmd [list HandleEditCourse $course]
+  $EditCourseMenu add command -label $course -command $cmd
+  }
+}
+
+proc HandleEditCourse {tocourse} {
+global db ridxref SelectedLine CourseNames CourseName EditIdx
+# When this proc is called, the currently selected entry will be changed to course $tocourse
+if {$EditIdx != -1} {
+  set CourseIdx [lsearch $CourseNames $tocourse]
+  set db(Course,$EditIdx) $CourseIdx
+  FindCorrectPunches $EditIdx
+  ErrorMsg "Changing course of ($EditIdx) $db(SICard,$EditIdx) $db(Name,$EditIdx) to $CourseName($CourseIdx)"
+  .editbox.coursemenu configure -text $CourseName($db(Course,$EditIdx))
+  }
+CalcResults
+}
+
+proc HandleEditDelete {} {
+global db ridxref SelectedLine EditIdx
+# Procedure is slightly misnamed. Actually is a toggle delete.
+# i.e. we will undelete a deleted entry, or delete an undeleted entry.
+if {$EditIdx != -1} {
+  if {$db(Use,$EditIdx) != 0} {
+    # Is in use. Delete it.
+    set db(Use,$EditIdx) 0
+    ErrorMsg "Removing ($EditIdx) $db(SICard,$EditIdx) $db(Name,$EditIdx) from results. "
+    # Toggle the name of the button
+    .editbox.remove configure -text "Undelete"
+    } else {
+    # Is not in use. Undelete it.
+    set db(Use,$EditIdx) 1
+    ErrorMsg "Undeleting ($EditIdx) $db(SICard,$EditIdx) $db(Name,$EditIdx). "
+    # Toggle the name of the button
+    .editbox.remove configure -text "Delete"
+    }
+  }
+CalcResults
+}
+
+proc HandleChangeHTMLTitle {} {
+CalcResults
+}
+
+proc FixKludge {} {
+global db
+# Fix Ruth Bromer's course for Lapihio event
+set db(Course,53) 3
+CalcResults
+}
+
+proc DoSpecial {} {
+global db EditCourseMenu
+puts "Hit special."
+$EditCourseMenu delete 0 1
+$EditCourseMenu add command -label NewLine1 -command {puts "Hit new line 1"}
+$EditCourseMenu add command -label NewLine2 -command {puts "Hit new line 2"}
+}
+
+
+#------------------------------------------------------------------------------------------------------
+# Output results to file
+#
+
+proc SaveResultsToFile {} {
+global resultslist workingdir DefaultOutputFilename 
+global OutputHTML DefaultOutputHTMLFilename
+
+if {$OutputHTML} {
+  set outfilename $DefaultOutputHTMLFilename
+  } else {
+  set outfilename $DefaultOutputFilename
+  }
+set outfilename [tk_getSaveFile -initialfile [file tail $outfilename] -initialdir $workingdir]
+if [catch {open $outfilename w} outfile] {
+  puts stderr "File opening error on write."
+  ErrorMsg "File opening error on write."
+  return
+  }
+foreach line $resultslist {
+  puts $outfile $line
+  }
+close $outfile
+
+}
+
+#------------------------------------------------------------------------------------------------------
+# Logging lines into the results window
+#
+
+proc ClearResultsAndRaw {} {
+global resultslist ridxref rawoutlist rawidxref 
+# Note: This function doesn't clear the image in the window; that would be handled 
+# automatically by just clearing the resultslist variable. Instead, what this does is
+# to clear all the variables associated with holding result output, including the "raw" output.
+# Use this routine to prepare to read a new results file, completely clearing the previous inputs.
+set resultslist {}
+set rawoutlist {}
+set ridxref {}
+set rawidxref {}
+}
+
+proc ClearResults {} {
+global resultslist ridxref rawoutlist rawidxref 
+# Clear the results output. Do not include the raw output in the results, but do not
+# delete the raw output either.
+# Expect to use thie routine to toggle the raw output off (but leave it in order to toggle
+# back on at a later time).
+set resultslist {}
+set ridxref {}
+}
+
+proc ClearResultsToRaw {} {
+global resultslist ridxref rawoutlist rawidxref
+# Clear the current detailed results output, leaving only the "raw" output at the top.
+# Use this routine to clear the output in preparation for a new clean results calculation.
+set resultslist $rawoutlist
+set ridxref $rawidxref
+}
+
+proc LogResult {msg {index "-1"}} {
+global resultslist ridxref
+# Put a line into the results output.
+# Note that each line in the results output will be associated with some
+# entry index (blank lines, headers, etc will reference -1, the null entry), so
+# that on clicking into the results window it will be possible, from the line 
+# clicked on, to look up what index this line refers to, and thus know what
+# entry is to be edited.  This proc keeps track of these line index references.
+# As a result, it will be a "bad idea" to simply add lines to the resultslist
+# manually.
+# Keep this next line here; useful for debugging.
+#puts "$msg"
+lappend resultslist $msg
+lappend ridxref $index
+}
+
+proc LogRawResult {msg {index "-1"}} {
+global resultslist ridxref rawoutlist rawidxref 
+# Log into the results window, but also save as "raw results".
+# The "raw" section is used mostly for debugging.
+# Keep this next line here; useful for debugging.
+#puts "$msg"
+lappend rawoutlist $msg
+lappend rawidxref $index
+LogResult $msg $index
+}
+
+#------------------------------------------------------------------------------------------------------
+# Error Messages, Warnings, etc
+#
+
+proc ErrorMsg { {msg ""} } {
+global errormessage errorlist ebox
+# Output a message into the error listbox. 
+# Used for errors and various warnings.
+#set errormessage $msg
+lappend errorlist $msg
+# Now scroll so that the end of the log error log is visible
+# (otherwise, we tend to see the old messages, not the new)
+$ebox see end
+}
+
+proc DelayedErrorMsg {index msg} {
+global db
+if {![info exists db(DelayedWarnings,$index)]} {
+  set db(DelayedWarnings,$index) {}
+  }
+lappend db(DelayedWarnings,$index) $msg
+}
+
+proc OutputDelayedWarnings {} {
+global db NumEntries
+# Output delayed warnings to ErrorMsg log
+# Loop through all entries, looking for any delayed warnings on entries that are still in use.
+for {set index 1} {$index <= $NumEntries} {incr index} {
+  if {[info exists db(Dup,$index)]} {
+    if {!$db(Dup,$index)} {
+      if {[info exists db(DelayedWarnings,$index)]} {
+        foreach warning $db(DelayedWarnings,$index) {
+          ErrorMsg $warning
+          }
+        set db(DelayedWarnings,$index) {}	;# Clear the warnings.
+        }
+      }
+    }
+  }  
+}
+
+
+#------------------------------------------------------------------------------------------------------
+# Quit
+#
+
+proc HandleQuit {} {
+# Include any user protections we want ("Do you really want to quit", "Save first?", etc
+# TODO: No protections coded at this time.
+
+# OK ... really quit now
+exit
+}
+
+#------------------------------------------------------------------------------------------------------
+# Main section
+#
+
+
+# Main window title
+wm title . SIDResults
+
+# The display will contain the following regions:
+#
+# .buttonrow 	A row of control buttons
+# .finfolines	A set of lines containing info about what files are being used 
+#		(input files, defaults chosen, etc)
+# .errorline	A line for outputting error and warning messages
+# .editrow	A row with boxes for "line editing" a selected line from output
+# .resultsbox	The main output region; a scrollable listbox containing the results
+#		output as it currently appears
+
+# Set up the control area (the button row)
+frame .buttonrow -borderwidth 5
+pack .buttonrow -side top -fill x
+button .buttonrow.setworkdir -text "Set Work Dir" -command SetWorkingDirectory
+button .buttonrow.setraw -text "Set Raw Datafile" -command ReadRawData
+button .buttonrow.setcoursefile -text "Set Course File" -command ReadCourses
+button .buttonrow.html -text "Turn HTML On" -command ToggleHTML
+button .buttonrow.output -text "Save Results" -command SaveResultsToFile
+button .buttonrow.quit -text Quit -command HandleQuit
+# Pack the buttons
+pack .buttonrow.setworkdir .buttonrow.setraw .buttonrow.setcoursefile -side left
+pack .buttonrow.quit .buttonrow.output .buttonrow.html -side right
+
+# Set up the file info lines
+frame .finfolines
+pack .finfolines -side top -fill x
+frame .finfolines.wdir
+frame .finfolines.rawfile
+frame .finfolines.courses
+frame .finfolines.htmltitle
+pack .finfolines.wdir .finfolines.rawfile .finfolines.courses .finfolines.htmltitle -side top -fill x
+set flabelwidth 12
+label .finfolines.wdir.label -width $flabelwidth -justify left    -text "Working Dir: "
+label .finfolines.wdir.val      -textvariable workingdir
+pack .finfolines.wdir.label .finfolines.wdir.val -side left
+label .finfolines.rawfile.label -width $flabelwidth -justify left -text "Raw File: "
+label .finfolines.rawfile.val   -textvariable rawdatafilename
+pack .finfolines.rawfile.label .finfolines.rawfile.val -side left
+label .finfolines.courses.label -width $flabelwidth -justify left -text "Course Desc File: "
+label .finfolines.courses.val   -textvariable coursefilename
+pack .finfolines.courses.label .finfolines.courses.val -side left
+label .finfolines.htmltitle.label -width $flabelwidth -justify left -text "HTML Page Title: "
+entry .finfolines.htmltitle.val -textvariable HTMLTitle -width 28
+bind .finfolines.htmltitle.val <Return> HandleChangeHTMLTitle
+pack .finfolines.htmltitle.label .finfolines.htmltitle.val -side left
+# The Good-To-Go variables
+set GTGRaw 0
+set GTGCourse 0
+set GTGResults 0
+
+# Set up error output scrollbox
+frame .errorbox
+pack .errorbox -side top -expand true -fill both
+set ebox [ScrolledListbox .errorbox.main -listvariable errorlist -width 100 -height 8 -font {courier 12 normal}]
+pack .errorbox.main -side left -expand true -fill both
+#grid .errorbox.main -sticky news
+#grid rowconfigure .errorbox 0 -weight 1
+#grid columnconfigure .errorbox 0 -weight 1
+
+# Set up a long text row
+# The width on the next label is set strangely to help with a yet untraced bug: the listboxes defined below
+# appear to become confused unless something forces the main window to be a little wider than they are trying
+# to be. (The bug appears associated with the addition of the scrollbars.)
+set tlabelwidth 100
+frame .textline
+pack .textline -side top -fill x
+label .textline.label -width $tlabelwidth -justify left -text " "
+pack .textline.label -side left
+
+# Set up the editing row
+set SeletedLine 0
+set EditIdx -1
+frame .editbox
+pack .editbox -side top -expand true -fill both
+#label .editbox.name -textvariable CurrentEditName -width 28
+entry .editbox.name -textvariable CurrentEditName -width 28
+bind .editbox.name <Return> HandleEditName
+# Course editing
+# Start with a default set of course names. 
+# (These will get changed after reading the real courses.)
+set CourseNames {Unknown White Yellow Orange Brown Green Red}
+#eval {tk_optionMenu .editbox.coursemenu UseCourse} $CourseNames
+#bind .editbox.coursemenu.menu <<MenuSelect>> {HandleEditCourse %W}
+# Would prefer to use tk_optionMenu, but there seems to be a bug in <<MenuSelect>>
+# Just build and manage the menu by hand:
+menubutton .editbox.coursemenu -text Course -menu .editbox.coursemenu.menu
+set EditCourseMenu [menu .editbox.coursemenu.menu]
+BuildCourseEditMenu $CourseNames
+button .editbox.remove -text " " -command HandleEditDelete
+#button .editbox.kludge -text "KLUDGE" -command FixKludge
+button .editbox.special -text "Special" -command DoSpecial
+#pack .editbox.name .editbox.coursemenu .editbox.remove .editbox.kludge -side left
+pack .editbox.name .editbox.coursemenu -side left
+pack .editbox.remove -side right
+
+# Set up the results area (the main scrollable listbox)
+frame .resultsbox
+pack .resultsbox -side top -expand true -fill both
+set rbox [ScrolledListbox .resultsbox.main -listvariable resultslist -selectmode single \
+          -width 100 -height 60 -font {courier 12 normal}]
+pack .resultsbox.main -side left -expand true -fill both
+#grid .resultsbox.main -sticky news
+#grid rowconfigure .resultsbox 0 -weight 1
+#grid columnconfigure .resultsbox 0 -weight 1
+
+bind $rbox <ButtonRelease-1> [list ActivateSelectedLine %W]
+focus $rbox
+
+ClearResultsAndRaw
+
+
+# Everything is now under the control of the event handlers for the above-defined buttons.
+# At this point, we just let things run.
+#------------------------------------------------------------------------------------------------------
+

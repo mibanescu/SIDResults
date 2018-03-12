@@ -8,8 +8,8 @@ exec wish "$0" ${1+"$@"}
 #	Ken. Hanson
 #	Started: 2008/02/27
 #
-set     SIDRVersion "0.89o"
-#       Last modified 2012/01/19
+set     SIDRVersion "0.89u"
+#       Last modified 2014/02/11
 #
 # This program is used to generate web-ready results from an 
 # Orienteering meet managed by e-punch. 
@@ -184,7 +184,9 @@ set debug 0		;# 0: No debug.  1: Basic monitoring.  2: Higher level.  3: Highest
 #              Remember to set AlwaysRecalcOnTimerEvent to force continuous updates			Done, but want better control(s)
 # 130109 Released 0.89o, which recognises the new version of the header files now found on results downloads.
 #        Still cleaning up code toward SIDR 0.90
-
+# 131004 0.89q Last save before revision to handle a-meet score-o.
+# 131006 0.89r Fixed Score-O output for AMeets. (Multi-column output still to be done.)
+# 140211 0.89u Fixed problem in GuessCourse, plus minor problem with handling a course-not-found situation.
 
 # Some globals
 #
@@ -2044,7 +2046,7 @@ if [catch {open $coursefilename r} coursefilehandle] {
       # HTMLTITLE
         } elseif {[lindex $worklinelist 0] eq "@htmltitle"} {
         set HTMLTitle [string range $line 11 end]
-        ErrorMsg "Entering A-Meet mode."
+        # ErrorMsg "Entering A-Meet mode."
       #
       # AMEET
         } elseif {[lindex $worklinelist 0] eq "@ameet"} {
